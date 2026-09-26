@@ -23,6 +23,9 @@ log = logging.getLogger(__name__)
 
 POLL_S = 0.1
 MAX_PLAY_WAIT_S = 2.0
+# Spamming one sound is one use: another start of the same sound within this many
+# seconds after the last counted start does not raise `plays` (spec A3).
+USE_WINDOW_S = 2.0
 # Bigger files (~10 min at 192 kbit/s) are not decoded at start: decoded audio costs
 # ~23 MB per minute, a 2-hour mix alone would hold 3 GB. They decode on the first play.
 LAZY_DECODE_BYTES = 15 * 1024 * 1024
@@ -43,6 +46,8 @@ class PlaybackService:
         self._poll_gen = 0  # stale device answers after stop_all carry an older number
         self._polling = False
         self._play_seq: dict[str, int] = {}  # per-sound stop counter, bumped by stop()
+        self._clock = time.monotonic  # tests swap in a fake clock
+        self._last_counted: dict[str, float] = {}  # sound id -> last start that counted
         core.handle(Play, lambda cmd: self.play(cmd.sound_id, cmd.volume, cmd.preview))
         core.handle(Stop, lambda cmd: self.stop(cmd.sound_id))
         core.handle(StopAll, lambda _cmd: self.stop_all())
@@ -59,8 +64,19 @@ class PlaybackService:
     # ---- decoding: core -> worker -> core ----
 
     def preload(self, sounds: list[dict]) -> None:
+        """Decode the most useful sounds first: a sound with a hotkey can fire the
+        instant the user presses it, so those go first; among the rest, the
+        most-played sounds are the ones most likely to be pressed again right after
+        start. Ties keep the original list order. The worker pool is FIFO
+        (executors.WorkerPool.submit -> a plain queue.Queue, popped in submission
+        order by whichever of its threads is free next), so submission order here
+        is the decode priority."""
+        ordered = sorted(
+            enumerate(sounds),
+            key=lambda pair: (0 if pair[1].get("hotkey") else 1, -pair[1].get("plays", 0), pair[0]),
+        )
         jobs = [(s["id"], self._core.store.data_dir / s["file"])
-                for s in sounds if s["id"] not in self._decoding]
+                for _index, s in ordered if s["id"] not in self._decoding]
         for sound_id, _path in jobs:  # mark first: inline workers answer immediately
             self._decoding.add(sound_id)
         for sound_id, path in jobs:
@@ -151,13 +167,24 @@ class PlaybackService:
             log.exception("playback of %s failed", sound_id)
             self._core.executor.submit(self._core.notice, PLAY_FAILED, "hint")
             return
-        self._core.executor.submit(self._started, sound_id, needle, token)
+        self._core.executor.submit(self._started, sound_id, needle, token, preview)
 
-    def _started(self, sound_id: str, needle: float, token: tuple[int, int]) -> None:  # core
-        if config.find_sound(self._core.store.data, sound_id) is None:
+    def _started(self, sound_id: str, needle: float, token: tuple[int, int],
+                preview: bool = False) -> None:  # core
+        sound = config.find_sound(self._core.store.data, sound_id)
+        if sound is None:
             return  # the sound was deleted while the play was in flight
         if token != (self._poll_gen, self._play_seq.get(sound_id, 0)):
             return  # a Stop(sound_id) or StopAll landed after this play was submitted
+        if not preview:
+            # A preview (VolumeDialog) is not a "play" for preload priority purposes,
+            # and spamming within USE_WINDOW_S is one use, not many.
+            now = self._clock()
+            last = self._last_counted.get(sound_id)
+            if last is None or now - last >= USE_WINDOW_S:
+                self._last_counted[sound_id] = now
+                sound["plays"] = sound.get("plays", 0) + 1
+                self._core.store.save_soon()  # debounced: clicks can come in fast
         self.playing.add(sound_id)
         self._core.emit(PlaybackStarted(sound_id, needle))
         self._core.state_changed()
@@ -219,6 +246,7 @@ class PlaybackService:
         """A sound was deleted: drop everything playback knows about it."""
         self._pending.pop(sound_id, None)
         self.missing.discard(sound_id)
+        self._last_counted.pop(sound_id, None)
         self._core.engine.forget(sound_id)
 
     def _hint_missing(self, sound_id: str) -> None:

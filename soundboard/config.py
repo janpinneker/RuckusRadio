@@ -16,6 +16,10 @@ MAX_SOUND_VOLUME = 1.5  # per-sound gain cap (150 %, about +3.5 dB), VolumeDialo
 MAX_OUTPUT_GAIN = 2.0  # about +6 dB, the top of the dB sliders on Einstellungen
 MONITOR_KEY = "__monitor__"  # the headphones inside config["outputs"]
 
+# The stop-all default until 1.1.x was Strg+Alt+Backspace - AltGr+Backspace on German
+# keyboards, a typing key. It moves to Strg+ß unless the user picked their own (spec C9).
+OLD_STOP_ALL_DEFAULT = "ctrl+alt+backspace"
+
 log = logging.getLogger(__name__)
 
 # True when the last load_config() found a corrupt config.json, moved it to
@@ -40,7 +44,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_mic_gain": 1.0,
     "autostart": False,
     "monitor_device": "default",
-    "stop_all_hotkey": "ctrl+alt+backspace",
+    "stop_all_hotkey": "ctrl+ß",  # Strg+ß: types nothing, no AltGr (spec C9, user 2026-09-26)
+    "stop_all_migrated": True,  # new installs never run the one-time migration below
     "sounds_offset_db": -6.0,  # sounds sit this far below the voice on every cable
     "ducking_enabled": True,  # lower the sounds on the cables while the user speaks
     "ducking_db": -6.0,
@@ -72,7 +77,25 @@ def _with_defaults(loaded: dict[str, Any]) -> dict[str, Any]:
     merged.update(loaded)
     _migrate_outputs(merged, loaded)
     _migrate_levels(merged, loaded)
+    _migrate_stop_all_hotkey(merged, loaded)
     return merged
+
+
+def _migrate_stop_all_hotkey(merged: dict[str, Any], loaded: dict[str, Any]) -> None:
+    """The stop-all default moved from the old AltGr-typing combo to Strg+ß (spec
+    C9). Migrate a config that still has the old default - but only once: a user who
+    later deliberately picks the old combo again must not be reverted on every load.
+    Also skip the migration if a sound already owns ctrl+ß (a rare but real
+    conflict), leaving the user's old stop-all combo in place rather than silently
+    stealing a sound's hotkey."""
+    if loaded.get("stop_all_migrated"):
+        return
+    if merged.get("stop_all_hotkey") == OLD_STOP_ALL_DEFAULT:
+        from .hotkeys import find_hotkey_conflict
+        new_default = DEFAULT_CONFIG["stop_all_hotkey"]
+        if not find_hotkey_conflict(new_default, merged.get("sounds") or [], None, None):
+            merged["stop_all_hotkey"] = new_default
+    merged["stop_all_migrated"] = True
 
 
 def _migrate_outputs(merged: dict[str, Any], loaded: dict[str, Any]) -> None:

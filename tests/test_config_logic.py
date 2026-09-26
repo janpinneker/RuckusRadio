@@ -1,5 +1,6 @@
 """Config-Migration auf den outputs-Schluessel, ohne die echte %APPDATA%-Datei."""
 
+import json
 import os
 import sys
 import tempfile
@@ -188,6 +189,83 @@ def test_version_2_resets_per_sound_volumes():
     print("version 2 resets per-sound volumes once: OK")
 
 
+def test_old_config_without_plays_survives_load_and_save():
+    """A config.json written before the plays counter existed must load fine (the
+    missing key means 0 plays, never a crash) and must not gain a fabricated value
+    that then gets written back."""
+    old = {
+        "version": config.CONFIG_VERSION,
+        "sounds": [{"id": "a", "name": "x", "file": "sounds/a.mp3",
+                   "icon": "icons/a.png", "hotkey": None, "volume": 1.0}],
+    }
+    path = config.config_path()
+    path.write_text(json.dumps(old), encoding="utf-8")
+    loaded = config.load_config()
+    sound = loaded["sounds"][0]
+    assert "plays" not in sound, "load must not invent a plays key"
+    assert sound.get("plays", 0) == 0
+
+    config.save_config(loaded)
+    reloaded = config.load_config()
+    assert "plays" not in reloaded["sounds"][0], "a round trip must not add it either"
+
+    reloaded["sounds"][0]["plays"] = 3
+    config.save_config(reloaded)
+    again = config.load_config()
+    assert again["sounds"][0]["plays"] == 3, "once set, it must survive save/load"
+    print("a config without plays loads fine and the counter survives save/load: OK")
+
+
+def test_stop_all_default_is_alt_delete_and_the_old_default_migrates():
+    assert config.DEFAULT_CONFIG["stop_all_hotkey"] == "ctrl+ß"
+    merged = config._with_defaults({"stop_all_hotkey": "ctrl+alt+backspace"})
+    assert merged["stop_all_hotkey"] == "ctrl+ß"
+    assert merged["stop_all_migrated"] is True
+    kept = config._with_defaults({"stop_all_hotkey": "ctrl+shift+s"})
+    assert kept["stop_all_hotkey"] == "ctrl+shift+s", "a user's own choice stays"
+    print("stop-all defaults to Alt+Entf; the old AltGr default migrates: OK")
+
+
+def test_stop_all_migration_is_one_time_and_skips_a_taken_alt_delete():
+    # A user who deliberately picks the old combo again after migration must not be
+    # reverted the next time their config.json is loaded.
+    once = config._with_defaults({"stop_all_hotkey": "ctrl+alt+backspace"})
+    assert once["stop_all_hotkey"] == "ctrl+ß"
+    once["stop_all_hotkey"] = "ctrl+alt+backspace"  # deliberately picked again
+    twice = config._with_defaults(once)
+    assert twice["stop_all_hotkey"] == "ctrl+alt+backspace", \
+        "a deliberate later choice of the old combo must survive"
+    assert twice["stop_all_migrated"] is True
+
+    # A fresh install's default config already carries the marker, so it never
+    # migrates even though it doesn't use the old combo.
+    assert config.DEFAULT_CONFIG["stop_all_migrated"] is True
+
+    # If a sound already owns ctrl+ß, the migration must not steal it - the
+    # user's old stop-all combo stays instead.
+    conflicting = config._with_defaults({
+        "stop_all_hotkey": "ctrl+alt+backspace",
+        "sounds": [{"id": "a", "name": "Airhorn", "file": "sounds/a.mp3",
+                   "icon": "icons/a.png", "hotkey": "ctrl+ß", "volume": 1.0}],
+    })
+    assert conflicting["stop_all_hotkey"] == "ctrl+alt+backspace", \
+        "must not steal a sound's hotkey"
+    assert conflicting["stop_all_migrated"] is True
+    print("stop-all migration runs once and skips a taken ctrl+ß: OK")
+
+
+def test_stop_all_migration_survives_non_string_hotkeys():
+    merged = config._with_defaults({
+        "stop_all_hotkey": "ctrl+alt+backspace",
+        "sounds": [{"id": "x", "name": "X", "hotkey": 5},
+                   {"id": "y", "name": "Y", "hotkey": ["ctrl+ß"]}],
+    })
+    assert merged["stop_all_hotkey"] == "ctrl+ß"
+    odd = config._with_defaults({"stop_all_hotkey": 42})
+    assert odd["stop_all_migrated"] is True
+    print("stop-all migration treats non-string hotkeys as no hotkey: OK")
+
+
 def main():
     test_fresh_config_has_outputs()
     test_old_config_keeps_working()
@@ -198,6 +276,10 @@ def main():
     test_set_output_settings_clamps()
     test_version_2_resets_the_hand_tuned_cable_gains()
     test_version_2_resets_per_sound_volumes()
+    test_old_config_without_plays_survives_load_and_save()
+    test_stop_all_default_is_alt_delete_and_the_old_default_migrates()
+    test_stop_all_migration_is_one_time_and_skips_a_taken_alt_delete()
+    test_stop_all_migration_survives_non_string_hotkeys()
     print("\nALL CONFIG LOGIC CHECKS PASSED")
 
 

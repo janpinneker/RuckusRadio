@@ -8,3 +8,6 @@ dist/
 assets/*.exe
 installer/Output/
 release-private.txt
+.firecrawl/
+webui/node_modules/
+webui/dist/

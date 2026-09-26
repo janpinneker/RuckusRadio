@@ -1,5 +1,6 @@
 """Wiedergabe im Testmodus: Kern, Geraete und Worker laufen sofort, Timer per advance()."""
 
+import json
 import os
 import sys
 import tempfile
@@ -11,7 +12,7 @@ os.environ["RUCKUS_DATA_DIR"] = _TMP
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from soundboard import dynamics, playback, protocol as p  # noqa: E402
+from soundboard import config, dynamics, playback, protocol as p, store  # noqa: E402
 from soundboard.layout import needle_for_index  # noqa: E402
 import core_fakes  # noqa: E402
 
@@ -59,6 +60,7 @@ def test_end_of_playback_is_polled_on_the_device():
     c.executor.advance(playback.POLL_S)
     assert core_fakes.of_type(events, p.PlaybackEnded) == [p.PlaybackEnded("s0")]
     assert service.playing == set()
+    c.store.flush()  # a successful play also queues a debounced plays-counter save
     assert c.executor.pending_timers() == 0, "polling stops when nothing plays"
     print("the end of a playback is noticed by polling: OK")
 
@@ -160,6 +162,7 @@ def test_a_failed_poll_does_not_get_stuck():
     assert core_fakes.of_type(events, p.PlaybackEnded) == [p.PlaybackEnded("s0")]
     assert service.playing == set()
     assert service._polling is False
+    c.store.flush()  # a successful play also queues a debounced plays-counter save
     assert c.executor.pending_timers() == 0
     # a later Play starts polling again
     c.send(p.Play("s0"))
@@ -238,6 +241,89 @@ def test_long_sounds_are_decoded_only_when_played():
     print("long sounds are decoded on the first play, not at start: OK")
 
 
+def test_preload_orders_hotkey_then_plays_then_index():
+    c, events, service = setup(n=4, loaded=False)
+    sounds = c.store.data["sounds"]
+    # s0: no hotkey, 0 plays; s1: no hotkey, 5 plays; s2: hotkey, 1 play; s3: no hotkey, 5 plays
+    sounds[1]["plays"] = 5
+    sounds[2]["hotkey"] = "f1"
+    sounds[2]["plays"] = 1
+    sounds[3]["plays"] = 5
+    service.preload(sounds)
+    # hotkeyed first, then by plays descending, ties broken by original list index
+    assert c.engine.preloads == ["s2", "s1", "s3", "s0"], c.engine.preloads
+    print("preload orders hotkeyed sounds first, then most-played, then list order: OK")
+
+
+class FakeClock:
+    def __init__(self, t=100.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def test_a_successful_play_increments_plays_and_a_preview_does_not():
+    c, events, service = setup()
+    clock = FakeClock()
+    service._clock = clock
+    sound = c.store.data["sounds"][0]
+    assert sound.get("plays", 0) == 0
+    c.send(p.Play("s0"))
+    assert sound["plays"] == 1, sound
+    clock.t += playback.USE_WINDOW_S + 0.5
+    c.send(p.Play("s0"))
+    assert sound["plays"] == 2
+    c.send(p.Play("s1", preview=True))
+    assert c.store.data["sounds"][1].get("plays", 0) == 0, "a preview must not count"
+    c.store.flush()
+    print("a successful play increments plays; a preview does not: OK")
+
+
+def test_spamming_within_the_use_window_counts_once():
+    assert playback.USE_WINDOW_S == 2.0
+    c, events, service = setup()
+    clock = FakeClock()
+    service._clock = clock
+    sound = c.store.data["sounds"][0]
+    for dt in (0.0, 0.4, 0.5):  # three starts within one second
+        clock.t += dt
+        c.send(p.Play("s0"))
+    assert sound["plays"] == 1, sound
+    assert len(core_fakes.of_type(events, p.PlaybackStarted)) == 3, "every click still plays"
+    clock.t += 2.5  # a start 2.5 s after the last counted one counts again
+    c.send(p.Play("s0"))
+    assert sound["plays"] == 2, sound
+    c.store.flush()
+    print("spamming the same sound within 2 s is one use: OK")
+
+
+def test_the_window_is_per_sound_and_previews_do_not_open_it():
+    c, events, service = setup()
+    clock = FakeClock()
+    service._clock = clock
+    c.send(p.Play("s0", preview=True))  # a preview neither counts nor starts a window
+    c.send(p.Play("s0"))
+    c.send(p.Play("s1"))
+    assert c.store.data["sounds"][0]["plays"] == 1
+    assert c.store.data["sounds"][1]["plays"] == 1
+    c.store.flush()
+    print("the use window is per sound; previews do not open it: OK")
+
+
+def test_the_plays_counter_is_persisted_debounced_not_on_every_play():
+    c, events, service = setup()
+    c.store.save_now()  # baseline: config.json exists on disk before any play
+    c.send(p.Play("s0"))
+    on_disk_before = json.loads(config.config_path().read_text(encoding="utf-8"))
+    assert on_disk_before["sounds"][0].get("plays", 0) == 0, \
+        "a single play must not write config.json synchronously"
+    c.executor.advance(store.SAVE_DEBOUNCE_S)
+    on_disk_after = json.loads(config.config_path().read_text(encoding="utf-8"))
+    assert on_disk_after["sounds"][0]["plays"] == 1
+    print("the plays counter is saved debounced, not synchronously on every play: OK")
+
+
 def main():
     test_play_uses_the_normalized_gain_and_reports_start()
     test_preview_goes_to_the_headphones_only()
@@ -255,6 +341,11 @@ def main():
     test_shutdown_stops_the_engines_own_streams()
     test_started_ignores_a_play_that_was_stopped_before_the_device_answered()
     test_started_ignores_a_play_stopped_by_a_single_stop()
+    test_preload_orders_hotkey_then_plays_then_index()
+    test_a_successful_play_increments_plays_and_a_preview_does_not()
+    test_spamming_within_the_use_window_counts_once()
+    test_the_window_is_per_sound_and_previews_do_not_open_it()
+    test_the_plays_counter_is_persisted_debounced_not_on_every_play()
     print("\nALL PLAYBACK LOGIC CHECKS PASSED")
 
 

@@ -11,12 +11,20 @@ sounddevice's PortAudio DLLs (shipped as the separate `_sounddevice_data`
 package sounddevice.py loads by path at runtime — must be data, not a hidden
 import, or the DLL never lands in the bundle). ffmpeg/ffprobe are pulled in
 as binaries so PyInstaller doesn't try to inspect them for Python deps.
+webui/dist is bundled when present; pywebview's own files come from its
+PyInstaller hook.
 """
 
 from PyInstaller.utils.hooks import collect_data_files
 
 datas = collect_data_files("customtkinter")
 datas += collect_data_files("_sounddevice_data")
+
+import os
+
+if os.path.isfile("webui/dist/index.html"):
+    datas += [("webui/dist", "webui/dist")]
+datas += collect_data_files("webview")  # pywebview's JS and the WebView2 loader DLLs
 
 binaries = [
     ("assets/ffmpeg.exe", "assets"),

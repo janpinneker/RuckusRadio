@@ -53,9 +53,12 @@ class Timer:
 
 
 class SerialExecutor:
-    def __init__(self, name: str, on_error: ErrorHandler = _log_error):
+    def __init__(self, name: str, on_error: ErrorHandler = _log_error,
+                 on_start: Callable[[], None] | None = None):
         self.name = name
         self._on_error = on_error
+        # Runs first on the thread itself, e.g. COM setup the thread's work depends on.
+        self._on_start = on_start
         self._queue: queue.Queue = queue.Queue()
         self._timers: list[tuple[float, int, Timer, Callable, tuple]] = []  # own thread only
         self._seq = itertools.count()
@@ -97,6 +100,8 @@ class SerialExecutor:
         return not self._thread.is_alive()
 
     def _run(self) -> None:
+        if self._on_start is not None:
+            _run_guarded(self._on_start, (), self._on_error)
         while True:
             wait = None
             if self._timers:

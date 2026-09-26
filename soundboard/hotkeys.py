@@ -34,6 +34,11 @@ class HotkeyManager:
             self.unregister(old_hotkey)
         self.register(new_hotkey, callback)
 
+    def validate(self, hotkey_str: str) -> None:
+        """Raises (ValueError) if the keyboard library cannot parse the combo -
+        checked before a combo is saved, so a bad one never replaces a working one."""
+        keyboard.parse_hotkey(hotkey_str)
+
 
 MODIFIER_KEYS = {"ctrl", "alt", "shift", "win", "windows"}
 
@@ -64,11 +69,18 @@ ALTGR_KEYS = {"alt gr", "altgr"}
 # scan codes), so a bare numpad hotkey would also fire while typing digits.
 FUNCTION_KEYS = {f"f{n}" for n in range(1, 25)}
 
+# Strg+Alt+Entf belongs to Windows (secure attention sequence); never assign it.
+RESERVED_HOTKEYS = {"ctrl+alt+delete"}
+RESERVED_MESSAGE = "Strg+Alt+Entf gehört Windows. Wähl eine andere Kombination."
+
 
 def normalize_hotkey(hotkey: str) -> str:
     """Lowercase, strip spaces, order-independent: modifiers sorted into the fixed
     canonical priority (ctrl, alt, shift, windows) then the non-modifier key(s), so
-    'alt+ctrl+1' and 'ctrl+alt+1' both normalize to 'ctrl+alt+1'."""
+    'alt+ctrl+1' and 'ctrl+alt+1' both normalize to 'ctrl+alt+1'. A non-string value
+    (hand-edited config.json) counts as no hotkey: ''."""
+    if not isinstance(hotkey, str):
+        return ""
     parts = [p.strip().lower() for p in hotkey.split("+") if p.strip()]
     modifiers = sorted(
         (p for p in parts if p in MODIFIER_KEYS),
@@ -76,6 +88,16 @@ def normalize_hotkey(hotkey: str) -> str:
     )
     rest = [p for p in parts if p not in MODIFIER_KEYS]
     return "+".join(modifiers + rest)
+
+
+def is_modifier_only(hotkey: str) -> bool:
+    """True if nothing but Strg/Alt/Shift/Win is left (or nothing at all) - such a
+    combo fires on every shortcut that uses the modifier."""
+    return not [p for p in normalize_hotkey(hotkey).split("+") if p and p not in MODIFIER_KEYS]
+
+
+def has_altgr(hotkey: str) -> bool:
+    return any(p in ALTGR_KEYS for p in normalize_hotkey(hotkey).split("+"))
 
 
 def is_plain_key(hotkey: str) -> bool:
@@ -97,10 +119,12 @@ def find_hotkey_conflict(
     """Returns the display name of whatever already owns this combo (another
     sound's name, or 'Alle stoppen' for the stop-all hotkey), or None if free."""
     normalized = normalize_hotkey(hotkey)
+    if not normalized:
+        return None
     if stop_all_hotkey and normalize_hotkey(stop_all_hotkey) == normalized:
         return "Alle stoppen"
     for s in sounds:
-        if s.get("id") == exclude_sound_id:
+        if not isinstance(s, dict) or s.get("id") == exclude_sound_id:
             continue
         existing = s.get("hotkey")
         if existing and normalize_hotkey(existing) == normalized:
@@ -139,6 +163,8 @@ def hotkey_error(
     stop-all. German message, or None if the combo is free. Typing side effects are
     only warnings - see typing_warning."""
     normalized = normalize_hotkey(hotkey)
+    if normalized in RESERVED_HOTKEYS:
+        return RESERVED_MESSAGE
     conflict = find_hotkey_conflict(normalized, sounds, exclude_sound_id, stop_all_hotkey)
     if conflict:
         return f"„{normalized.upper()}“ ist schon „{conflict}“ zugewiesen. Wähl eine andere Kombination."

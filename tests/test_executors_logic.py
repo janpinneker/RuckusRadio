@@ -121,6 +121,29 @@ def test_worker_pool_runs_in_parallel_and_reports_errors():
     print("worker pool runs jobs in parallel and reports errors: OK")
 
 
+def test_serial_on_start_runs_first_on_its_own_thread():
+    seen = []
+    ex = executors.SerialExecutor(
+        "test-on-start", on_start=lambda: seen.append(("start", threading.current_thread().name)))
+    ex.submit(lambda: seen.append(("task", threading.current_thread().name)))
+    wait_until(lambda: len(seen) == 2)
+    assert seen == [("start", "test-on-start"), ("task", "test-on-start")], seen
+    ex.stop()
+
+
+def test_serial_survives_a_failing_on_start():
+    errors, seen = [], []
+
+    def boom():
+        raise RuntimeError("no COM")
+
+    ex = executors.SerialExecutor("test-on-start-fail", errors.append, on_start=boom)
+    ex.submit(lambda: seen.append(1))
+    wait_until(lambda: seen == [1])
+    assert len(errors) == 1 and "no COM" in str(errors[0])
+    ex.stop()
+
+
 def main():
     test_serial_runs_in_order_on_its_own_thread()
     test_serial_survives_a_failing_task()
@@ -128,6 +151,8 @@ def main():
     test_serial_stop_runs_queued_work_first()
     test_inline_runs_now_and_timers_on_advance()
     test_worker_pool_runs_in_parallel_and_reports_errors()
+    test_serial_on_start_runs_first_on_its_own_thread()
+    test_serial_survives_a_failing_on_start()
     print("\nALL EXECUTORS LOGIC CHECKS PASSED")
 
 

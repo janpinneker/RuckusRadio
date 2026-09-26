@@ -9,7 +9,24 @@ installed or a USB device is plugged in):
 * the **monitor** (your own headphones) and the **real microphone**.
 """
 
+import ctypes
+
 import sounddevice as sd
+
+COINIT_MULTITHREADED = 0
+
+
+def init_thread_com() -> None:
+    """Initialise COM (MTA) on the calling thread; call first on every thread that
+    opens PortAudio streams. PortAudio only sets COM up on the thread that ran
+    Pa_Initialize, and a WASAPI stream started on any other thread without COM fails
+    with PaErrorCode -9999 ("Unanticipated host error"). Never uninitialised: the
+    thread keeps COM for its lifetime. No-op off Windows."""
+    try:
+        ole32 = ctypes.windll.ole32
+    except AttributeError:
+        return
+    ole32.CoInitializeEx(None, COINIT_MULTITHREADED)  # S_FALSE / changed mode: fine
 
 
 def _hostapi_names() -> list[str]:

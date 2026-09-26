@@ -16,6 +16,7 @@ EXAMPLES = [
     p.AddSound("C:/a.mp3", "Airhorn"), p.AddSound("C:/a.mp4", "Horn", "C:/i.png"),
     p.DeleteSound("id1"), p.RenameSound("id1", "Neu"), p.SetSoundIcon("id1", "C:/i.png"),
     p.SetSoundVolume("id1", 0.5), p.SetHotkey("id1", "ctrl+shift+1"), p.RemoveHotkey("id1"),
+    p.SetStopAllHotkey("alt+delete"),
     p.SuspendHotkeys(), p.ResumeHotkeys(), p.ExportSounds("C:/x.ruckuspack"),
     p.ExportSounds("C:/x.ruckuspack", ("id1", "id2")), p.ImportPack("C:/x.ruckuspack"),
     p.Play("id1"), p.Play("id1", 1.5), p.Stop("id1"), p.StopAll(),

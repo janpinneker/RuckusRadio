@@ -53,6 +53,7 @@ def test_ellipsize_and_keycap():
     assert len(ellipsize("Sehr langer Soundname", 14)) == 14
     assert keycap_text("ctrl+alt+1") == "CTRL+ALT+1"
     assert keycap_text(None) is None
+    assert keycap_text("ctrl+ß") == "CTRL+ß", "ß must not become SS"
     assert keycap_text("") is None
     print("ellipsize + keycap_text: OK")
 

@@ -181,6 +181,11 @@ class FakeHotkeys:
     def unregister_all(self):
         self.registered.clear()
 
+    def validate(self, hotkey):
+        # stands in for keyboard.parse_hotkey: "bad" is a key name it cannot map
+        if "bad" in hotkey.split("+"):
+            raise ValueError("unparsable hotkey")
+
     def rebind(self, old_hotkey, new_hotkey, callback):
         if old_hotkey:
             self.registered.pop(old_hotkey, None)

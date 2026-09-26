@@ -11,7 +11,9 @@ the cables and the microphone.
 
 Until `onboarding_completed` is set, the first-run assistant opens instead of the
 board (audio + hotkeys are already live so its sound/hotkey steps work); closing
-it early shows the board and it returns on the next start."""
+it early shows the board and it returns on the next start.
+
+`--webui` opens the pywebview window of soundboard.webmain instead of Tk (probe build B0)."""
 
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 
-from soundboard import config, singleinstance
+from soundboard import config, measure, singleinstance
 from soundboard.core import create_core
 from soundboard.gui import RuckusRadioApp
 from soundboard.hotkeys import HotkeyManager
@@ -50,6 +52,34 @@ def configure_logging(data_dir: Path) -> RotatingFileHandler:
 
 
 ALREADY_RUNNING = "Ruckus Radio läuft schon – schau in der Taskleiste nach."
+
+WEBUI_FAILED = """Die Web-Oberfläche konnte nicht starten:
+{}
+
+Starte Ruckus Radio ohne --webui."""
+
+
+def _show_error(text: str) -> None:
+    root = tk.Tk()  # hidden parent, as for ALREADY_RUNNING
+    root.withdraw()
+    messagebox.showerror("Ruckus Radio", text, parent=root)
+    root.destroy()
+
+
+def run_webui(runner=None, show=None) -> bool:
+    """`--webui` (probe build B0). A missing webui/dist, pythonnet or WebView2 - or any
+    other failure - is logged and shown; the windowed exe never ends silently."""
+    try:
+        if runner is None:
+            from soundboard import webmain
+
+            runner = lambda: webmain.run(on_window=measure.attach_web)  # noqa: E731
+        runner()
+        return True
+    except Exception as exc:  # noqa: BLE001 - every start failure must reach the user
+        log.exception("web interface failed to start")
+        (show or _show_error)(WEBUI_FAILED.format(exc))
+        return False
 
 
 def build_app(core=None, with_hotkeys: bool = True) -> RuckusRadioApp:
@@ -155,8 +185,13 @@ def main() -> None:
         root.destroy()
         return
     try:
+        if "--webui" in sys.argv[1:]:
+            log.info("Ruckus Radio starting (web interface)")
+            run_webui()
+            return
         log.info("Ruckus Radio starting")
         app = build_app()
+        measure.attach_tk(app)  # no-op unless RUCKUS_MEASURE_DIR is set (probe build B0)
         show_first_screen(app)
         app.mainloop()
     finally:

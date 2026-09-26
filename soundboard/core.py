@@ -43,7 +43,9 @@ class Core:
             self.workers = InlineExecutor(self._task_failed)
         else:
             self.executor = SerialExecutor("ruckus-core", self._task_failed)
-            self.devices = SerialExecutor("ruckus-devices", self._task_failed)
+            from .devices import init_thread_com
+            self.devices = SerialExecutor("ruckus-devices", self._task_failed,
+                                          on_start=init_thread_com)
             self.workers = WorkerPool(2, self._task_failed)
         self.store = Store(self.executor, data=store_data)
         self.store.on_save_failed = lambda _exc: self.notice(SAVE_FAILED, "hint")

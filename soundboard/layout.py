@@ -25,7 +25,8 @@ def ellipsize(text: str, limit: int = 14) -> str:
 
 
 def keycap_text(hotkey: str | None) -> str | None:
-    return hotkey.upper() if hotkey else None
+    # "ß".upper() is "SS" - keep the German sharp s as it is printed on the key.
+    return "".join(ch if ch == "ß" else ch.upper() for ch in hotkey) if hotkey else None
 
 
 def needle_for_index(i: int, n: int) -> float:

@@ -72,6 +72,7 @@ def test_round_trip_export_import():
     src_dir = new_data_dir()
     src_config = blank_config()
     sound = make_sound(src_dir, src_config, "Klaxon", volume=0.7)
+    sound["plays"] = 42  # a local usage count, must not travel with the pack either
 
     dest_zip = Path(tempfile.mkdtemp()) / "Klaxon.ruckuspack"
     result = export_pack(src_config, src_dir, [sound["id"]], dest_zip)
@@ -87,6 +88,7 @@ def test_round_trip_export_import():
     assert new_sound["name"] == "Klaxon"
     assert new_sound["volume"] == 0.7
     assert new_sound["hotkey"] is None, "hotkeys are not exported"
+    assert new_sound.get("plays", 0) == 0, "plays counters are not exported either"
 
     audio_path = dst_dir / new_sound["file"]
     icon_path = dst_dir / new_sound["icon"]

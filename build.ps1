@@ -72,6 +72,26 @@ if (-not (Test-Path $iconPath)) {
     & $venvPython tools\make_icon.py
 }
 
+$webui = Join-Path $root "webui"
+if (Test-Path (Join-Path $webui "package.json")) {
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        throw "webui\ needs Node.js (npm) to build - install it from https://nodejs.org. Without it the exe would ship without its web interface."
+    }
+    & $venvPython tools\gen_protocol_ts.py --check
+    if ($LASTEXITCODE -ne 0) { throw "webui\src\bridge\protocol.gen.json is stale: run 'venv\Scripts\python.exe tools\gen_protocol_ts.py'." }
+    Write-Output "Building the web interface..."
+    Push-Location $webui
+    try {
+        npm ci --no-audit --no-fund
+        if ($LASTEXITCODE -ne 0) { throw "npm ci failed in webui\" }
+        npm run build
+        if ($LASTEXITCODE -ne 0) { throw "npm run build failed in webui\" }
+    } finally {
+        Pop-Location
+    }
+    if (-not (Test-Path (Join-Path $webui "dist\index.html"))) { throw "webui\dist\index.html is missing after the build." }
+}
+
 Write-Output "Running PyInstaller..."
 & (Join-Path $root "venv\Scripts\pyinstaller.exe") build.spec --noconfirm
 

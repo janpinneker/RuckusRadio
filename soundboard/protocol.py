@@ -89,6 +89,11 @@ class RemoveHotkey(Command):
 
 
 @message
+class SetStopAllHotkey(Command):
+    hotkey: str
+
+
+@message
 class SuspendHotkeys(Command):
     pass
 

@@ -108,9 +108,16 @@ def test_typing_warnings_never_refuse():
     for combo in ("ctrl+shift+1", "f9", "f24", "ctrl+alt+shift+1", "ctrl+alt+f5",
                   "windows+ctrl+alt+q", "ctrl+q", "alt+1", "shift+f2"):
         assert err(combo) is None, (combo, err(combo))
-    # the default stop-all combo: backspace types no character, so no warning
+    # the old stop-all combo: backspace types no character, so no warning
     assert typing_warning("ctrl+alt+backspace") is None
     print("typing side effects only warn, every combo is allowed: OK")
+
+
+def test_ctrl_alt_delete_is_reserved_for_windows():
+    from soundboard.hotkeys import RESERVED_HOTKEYS, hotkey_error
+    assert "ctrl+alt+delete" in RESERVED_HOTKEYS
+    assert hotkey_error("alt+ctrl+delete", [], None, "alt+delete") == "Strg+Alt+Entf gehört Windows. Wähl eine andere Kombination."
+    print("Strg+Alt+Entf is never assigned: OK")
 
 
 def _settle(app, ms=150):
@@ -160,6 +167,7 @@ if __name__ == "__main__":
     test_find_hotkey_conflict()
     test_hotkey_error()
     test_typing_warnings_never_refuse()
+    test_ctrl_alt_delete_is_reserved_for_windows()
     core, _events = core_fakes.make_core()
     shared_app = RuckusRadioApp(core)
     shared_app.withdraw()

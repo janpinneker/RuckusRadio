@@ -196,7 +196,19 @@ def test_a_hotkey_plays_while_the_ui_thread_is_blocked():
     print("a hotkey plays within 0.3 s while the UI thread is blocked: OK")
 
 
+def test_the_device_thread_sets_up_com_first():
+    """WASAPI streams fail with PaErrorCode -9999 on a thread without COM: the very
+    first open after start used to fail until a rescan re-initialised PortAudio."""
+    from soundboard import devices
+    c, _events, _engine, _backend, _hotkeys = threaded_core()
+    assert c.devices._on_start is devices.init_thread_com, c.devices._on_start
+    assert c.executor._on_start is None
+    assert c.shutdown() is True
+    print("device thread initialises COM before any device work: OK")
+
+
 def main():
+    test_the_device_thread_sets_up_com_first()
     test_device_work_only_on_the_device_thread()
     test_plays_wait_behind_a_rescan_and_the_core_keeps_answering()
     test_a_play_stuck_too_long_is_dropped()
