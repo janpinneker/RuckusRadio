@@ -33,6 +33,9 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
+; a Ruckus Radio process that ignores the Restart Manager must not abort a silent
+; in-app update (suppressed message box = Abort = rollback, no relaunch)
+CloseApplications=force
 
 [Languages]
 Name: "german"; MessagesFile: "compiler:Languages\German.isl"
@@ -89,7 +92,7 @@ var
 
 const
   AppMutexName = 'Local\RuckusRadioSingleInstance';
-  UpdateWaitMs = 20000;
+  UpdateWaitMs = 30000;
 
 function IsUpdateRun: Boolean;
 var
@@ -101,12 +104,31 @@ begin
       Result := True;
 end;
 
+{ Number of running RuckusRadio.exe processes (WMI); 0 if WMI is unavailable. }
+function AppProcessCount: Integer;
+var
+  Locator, Service, Items: Variant;
+begin
+  Result := 0;
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('.', 'root\CIMV2');
+    Items := Service.ExecQuery('SELECT ProcessId FROM Win32_Process WHERE Name = ''{#MyAppExeName}''');
+    Result := Items.Count;
+  except
+    Result := 0;
+  end;
+end;
+
 function InitializeSetup: Boolean;
 var
   Waited: Integer;
 begin
   { In-app update: Ruckus Radio is still shutting down when it starts us. Wait until
-    it has released its single-instance mutex, at most UpdateWaitMs. }
+    it has released its single-instance mutex AND every RuckusRadio.exe process is
+    gone - the onefile exe keeps running for a moment after the mutex is released
+    (it cleans up its unpacked files), and a running exe cannot be replaced.
+    At most UpdateWaitMs in total; CloseApplications=force handles a leftover. }
   if IsUpdateRun then
   begin
     Waited := 0;
@@ -115,6 +137,12 @@ begin
       Sleep(250);
       Waited := Waited + 250;
     end;
+    while (AppProcessCount > 0) and (Waited < UpdateWaitMs) do
+    begin
+      Sleep(250);
+      Waited := Waited + 250;
+    end;
+    Log(Format('Waited %d ms for Ruckus Radio to exit, %d process(es) left', [Waited, AppProcessCount]));
   end;
   Result := True;
 end;
