@@ -149,15 +149,36 @@ class BoardView(ctk.CTkFrame):
         self.scroll.grid_columnconfigure(tuple(range(theme.COLUMNS)), weight=1, uniform="col")
         self.empty_label = ctk.CTkLabel(self.scroll, text="", text_color=theme.MUTED, font=theme.body_font())
         self._shown_query: str | None = None
+        self._placed: dict[ctk.CTkFrame, tuple[int, int]] = {}  # widget -> (row, column) on screen
 
     def rebuild(self):
-        for widget in list(self.tiles.values()) + self.slots:
-            widget.destroy()
-        self.tiles = {s["id"]: SoundTile(self.scroll, self.app, s) for s in self.app.sounds()}
-        n = len(self.tiles)
-        self.slots = [PlaceholderSlot(self.scroll, self.app.open_add_dialog) for _ in range(slots_total(n) - n)]
+        """Bring the tiles in line with the sounds, touching only what changed: a tile whose
+        sound data is unchanged stays as it is, a changed sound (name, hotkey, icon_rev,
+        loudness ...) gets a fresh tile, new sounds get new tiles, removed ones lose theirs.
+        Placeholder slots are added or removed only by the difference."""
+        old = self.tiles
+        tiles: dict[str, SoundTile] = {}
+        for sound in self.app.sounds():
+            tile = old.pop(sound["id"], None)
+            if tile is not None and tile.sound != sound:
+                self._drop(tile)
+                tile = None
+            tiles[sound["id"]] = tile or SoundTile(self.scroll, self.app, sound)
+        for tile in old.values():
+            self._drop(tile)
+        self.tiles = tiles
+        n = len(tiles)
+        wanted = slots_total(n) - n
+        while len(self.slots) > wanted:
+            self._drop(self.slots.pop())
+        while len(self.slots) < wanted:
+            self.slots.append(PlaceholderSlot(self.scroll, self.app.open_add_dialog))
         self._shown_query = None
         self.apply_filter()
+
+    def _drop(self, widget) -> None:
+        self._placed.pop(widget, None)
+        widget.destroy()
 
     def apply_filter(self):
         query = self.search.get()
@@ -167,14 +188,16 @@ class BoardView(ctk.CTkFrame):
         sounds = self.app.sounds()
         matches = filter_sounds(sounds, query)
         searching = bool(query.strip())
-        for widget in list(self.tiles.values()) + self.slots:
-            widget.grid_forget()
         self.empty_label.grid_forget()
 
         visible = [self.tiles[s["id"]] for s in matches] + ([] if searching else self.slots)
-        for i, widget in enumerate(visible):
-            row, col = divmod(i, theme.COLUMNS)
-            widget.grid(row=row, column=col, pady=(8, 16))
+        placed = {widget: divmod(i, theme.COLUMNS) for i, widget in enumerate(visible)}
+        for widget in self._placed.keys() - placed.keys():
+            widget.grid_forget()
+        for widget, (row, col) in placed.items():
+            if self._placed.get(widget) != (row, col):  # only moved or new widgets
+                widget.grid(row=row, column=col, pady=(8, 16))
+        self._placed = placed
         if searching and not matches:
             self.empty_label.configure(text=f"Kein Sound passt zu „{query.strip()}“.")
             self.empty_label.grid(row=0, column=0, columnspan=theme.COLUMNS, pady=48)

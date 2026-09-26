@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
+import types
 from pathlib import Path
 
 
@@ -35,6 +37,7 @@ def configure_ffmpeg() -> str | None:
 
     Returns the ffmpeg path pydub was pointed at, or None when falling back
     to PATH resolution."""
+    hide_pydub_consoles()
     assets_dir = resource_path("assets")
     ffmpeg = assets_dir / "ffmpeg.exe"
     ffprobe = assets_dir / "ffprobe.exe"
@@ -47,6 +50,30 @@ def configure_ffmpeg() -> str | None:
     # no AudioSegment.ffprobe needed: pydub finds ffprobe.exe via the PATH prepend below
     os.environ["PATH"] = str(assets_dir) + os.pathsep + os.environ.get("PATH", "")
     return str(ffmpeg)
+
+
+def hide_pydub_consoles() -> None:
+    """pydub starts ffmpeg/ffprobe with a plain Popen. In the windowed exe every decode
+    then opens a console window (on Windows 11 a Terminal window that can stay on top of
+    the board). Give pydub a Popen that always adds CREATE_NO_WINDOW. Idempotent."""
+    flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if not flag:
+        return
+    from pydub import audio_segment, utils
+
+    if getattr(utils.Popen, "hides_console", False):
+        return
+
+    class NoWindowPopen(subprocess.Popen):
+        hides_console = True
+
+        def __init__(self, *args, **kwargs):
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | flag
+            super().__init__(*args, **kwargs)
+
+    utils.Popen = NoWindowPopen  # mediainfo/ffprobe: `from subprocess import Popen`
+    # decode/export: audio_segment calls subprocess.Popen through its module reference
+    audio_segment.subprocess = types.SimpleNamespace(**{**vars(subprocess), "Popen": NoWindowPopen})
 
 
 def ffmpeg_path() -> str | None:

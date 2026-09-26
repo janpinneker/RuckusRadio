@@ -63,6 +63,29 @@ def test_board_follows_the_core_state():
     print("the board follows the core state (add, rename, delete): OK")
 
 
+def test_board_only_touches_the_changed_tile():
+    app, c, events = make_app()
+    first = add_fixture_sound(app, "Eins")
+    kept = app.board.tiles[first["id"]]
+    slots = list(app.board.slots)
+    second = add_fixture_sound(app, "Zwei")
+    assert app.board.tiles[first["id"]] is kept, "adding a sound must not rebuild the others"
+    assert app.board.slots == slots[:len(app.board.slots)], "slots are only trimmed, not rebuilt"
+    renamed = app.board.tiles[second["id"]]
+    app.rename_sound(second, "Drei")
+    assert app.board.tiles[first["id"]] is kept, "renaming one sound keeps the other tile"
+    assert app.board.tiles[second["id"]] is not renamed, "the renamed sound gets a fresh tile"
+    app.delete_sound(second["id"])
+    assert app.board.tiles[first["id"]] is kept, "deleting one sound keeps the other tile"
+    assert len(app.board.tiles) + len(app.board.slots) == len(app.board._placed)
+    redraws: list[str] = []
+    kept.name_label.configure = lambda **kw: redraws.append("name")
+    app._apply_state(dict(app.snapshot, sounds=list(app.snapshot["sounds"])))
+    assert redraws == [], "an unchanged state update must not redraw the tile"
+    app.destroy()
+    print("the board touches only the changed tile (add, rename, delete, state tick): OK")
+
+
 def test_click_plays_and_rings_until_the_end():
     app, c, events = make_app()
     sound = add_fixture_sound(app)
@@ -750,6 +773,7 @@ def test_pump_stops_once_a_callback_closes_the_app():
 def main():
     tests = [
         test_board_follows_the_core_state,
+        test_board_only_touches_the_changed_tile,
         test_click_plays_and_rings_until_the_end,
         test_notices_reach_dock_and_dialogs,
         test_icon_change_rebuilds_the_tile,

@@ -103,6 +103,27 @@ def test_parse_treats_silence_as_silent_not_failed():
     print("parser treats silence as silent, not failed: OK")
 
 
+def test_pydub_starts_ffmpeg_without_a_console_window():
+    import subprocess
+    from pydub import AudioSegment
+    paths.configure_ffmpeg()
+    seen: list[int] = []
+    real_init = subprocess.Popen.__init__
+
+    def spy(self, *args, **kwargs):
+        seen.append(kwargs.get("creationflags", 0))
+        real_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = spy
+    try:
+        AudioSegment.from_file(str(FIXTURES / "test_tone.mp4"))  # ffprobe + ffmpeg
+    finally:
+        subprocess.Popen.__init__ = real_init
+    assert seen, "pydub started no process"
+    assert all(flags & subprocess.CREATE_NO_WINDOW for flags in seen), seen
+    print("pydub runs ffmpeg/ffprobe without console windows: OK")
+
+
 def main():
     test_parse_reads_summary_and_loudest_short_term()
     test_parse_without_summary_is_none()
@@ -111,6 +132,7 @@ def main():
     test_ffmpeg_is_found()
     test_analyze_measures_the_fixture()
     test_measure_dict_marks_failures()
+    test_pydub_starts_ffmpeg_without_a_console_window()
     print("\nALL LOUDNESS LOGIC CHECKS PASSED")
 
 

@@ -170,6 +170,8 @@ class SoundTile(ctk.CTkFrame):
 
     def set_missing(self, missing: bool) -> None:
         """Audio file missing/unreadable: MUTED name, 'Datei fehlt' in place of the keycap."""
+        if missing == self._missing:
+            return  # called on every state update: an unchanged tile must not redraw
         self._missing = missing
         self.name_label.configure(text_color=theme.MUTED if missing else theme.TEXT)
         text, color = ("Datei fehlt", theme.MUTED) if missing else self._hotkey_look
