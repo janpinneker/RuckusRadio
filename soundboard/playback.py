@@ -1,0 +1,226 @@
+"""Wiedergabe: Sounds abspielen, vorladen, "spielt gerade" verfolgen, stoppen.
+
+Kern-Thread: Entscheidungen und Zustand (missing, pending, playing).
+Geraete-Thread: alles, was die AudioEngine mit PortAudio tut - play, stop, stop_all
+und playing_ids (raeumt fertige Wiedergaben ab und schliesst dabei Streams).
+Worker: Dekodieren (engine.preload; der Cache der Engine ist per Lock geschuetzt).
+
+Ein Play, das hinter einem langen Geraete-Umbau in der Warteschlange stand, wird nach
+MAX_PLAY_WAIT_S verworfen statt verspaetet loszuplatzen.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+
+from . import config, levels
+from .layout import needle_for_index
+from .protocol import Play, PlaybackEnded, PlaybackStarted, SoundMissing, Stop, StopAll
+
+log = logging.getLogger(__name__)
+
+POLL_S = 0.1
+MAX_PLAY_WAIT_S = 2.0
+# Bigger files (~10 min at 192 kbit/s) are not decoded at start: decoded audio costs
+# ~23 MB per minute, a 2-hour mix alone would hold 3 GB. They decode on the first play.
+LAZY_DECODE_BYTES = 15 * 1024 * 1024
+PLAY_FAILED = "Wiedergabe fehlgeschlagen. Prüf das Ausgabegerät in den Windows-Soundeinstellungen."
+PLAY_DROPPED = ("Sound verworfen – die Audiogeräte wurden gerade neu eingerichtet. "
+                "Noch einmal drücken.")
+MISSING = "Datei fehlt: „{name}“. Sound löschen und neu hinzufügen."
+
+
+class PlaybackService:
+    def __init__(self, core):
+        self._core = core
+        self.missing: set[str] = set()
+        self.playing: set[str] = set()
+        # waiting for an on-demand decode -> (volume, preview)
+        self._pending: dict[str, tuple[float, bool]] = {}
+        self._decoding: set[str] = set()
+        self._poll_gen = 0  # stale device answers after stop_all carry an older number
+        self._polling = False
+        self._play_seq: dict[str, int] = {}  # per-sound stop counter, bumped by stop()
+        core.handle(Play, lambda cmd: self.play(cmd.sound_id, cmd.volume, cmd.preview))
+        core.handle(Stop, lambda cmd: self.stop(cmd.sound_id))
+        core.handle(StopAll, lambda _cmd: self.stop_all())
+        core.add_state("playback", self.snapshot)
+        core.on_start(lambda: self.preload(self._sounds()))
+        core.on_shutdown(lambda: self._core.devices.submit(self._core.engine.stop_all))
+
+    def _sounds(self) -> list[dict]:
+        return self._core.store.data["sounds"]
+
+    def snapshot(self) -> dict:
+        return {"playing": sorted(self.playing), "missing": sorted(self.missing)}
+
+    # ---- decoding: core -> worker -> core ----
+
+    def preload(self, sounds: list[dict]) -> None:
+        jobs = [(s["id"], self._core.store.data_dir / s["file"])
+                for s in sounds if s["id"] not in self._decoding]
+        for sound_id, _path in jobs:  # mark first: inline workers answer immediately
+            self._decoding.add(sound_id)
+        for sound_id, path in jobs:
+            self._core.workers.submit(self._decode, sound_id, path, True)
+
+    def _decode(self, sound_id: str, path: Path, up_front: bool = False) -> None:  # worker
+        if up_front:
+            try:
+                too_long = path.stat().st_size > LAZY_DECODE_BYTES
+            except OSError:
+                too_long = False  # a missing file is reported by the decode below
+            if too_long:
+                self._core.executor.submit(self._decoding.discard, sound_id)
+                return
+        try:
+            self._core.engine.preload(sound_id, path)
+            ok = True
+        except Exception:
+            log.warning("decoding %s failed", path, exc_info=True)
+            ok = False
+        self._core.executor.submit(self._decoded, sound_id, ok)
+
+    def _decoded(self, sound_id: str, ok: bool) -> None:  # core
+        self._decoding.discard(sound_id)
+        if config.find_sound(self._core.store.data, sound_id) is None:
+            self._core.engine.forget(sound_id)  # deleted while decoding
+            self._pending.pop(sound_id, None)
+            return
+        changed = (sound_id in self.missing) == ok
+        if ok:
+            self.missing.discard(sound_id)
+        else:
+            self.missing.add(sound_id)
+            self._core.emit(SoundMissing(sound_id))
+        if changed:
+            self._core.state_changed()
+        pending = self._pending.pop(sound_id, None)
+        if pending is None:
+            return
+        if ok:
+            self.play(sound_id, *pending)
+        else:
+            self._hint_missing(sound_id)
+
+    # ---- playing ----
+
+    def play(self, sound_id: str, volume: float | None = None, preview: bool = False) -> None:
+        sounds = self._sounds()
+        index = next((i for i, s in enumerate(sounds) if s["id"] == sound_id), None)
+        if index is None:
+            return
+        if sound_id in self.missing:
+            self._hint_missing(sound_id)
+            return
+        sound = sounds[index]
+        # second guard behind packs/VolumeDialog: config.json may be hand-edited
+        volume = config.clamp_volume(sound.get("volume", 1.0) if volume is None else volume)
+        if not self._core.engine.is_loaded(sound_id):
+            self._pending[sound_id] = (volume, preview)
+            if sound_id not in self._decoding:
+                self._decoding.add(sound_id)
+                self._core.workers.submit(self._decode, sound_id,
+                                          self._core.store.data_dir / sound["file"])
+            return
+        gain = levels.play_gain(sound, volume)
+        needle = needle_for_index(index, len(sounds))
+        # a play token: (stop-all generation, per-sound stop counter) as they stood at
+        # submit time - a later StopAll or Stop(sound_id) bumps one of them, so a stale
+        # answer from the device thread is recognized and dropped in _started.
+        token = (self._poll_gen, self._play_seq.get(sound_id, 0))
+        self._core.devices.submit(self._play_on_device, sound_id, gain, needle,
+                                  time.monotonic(), token, preview)
+
+    def _play_on_device(self, sound_id: str, gain: float, needle: float,
+                        queued_at: float, token: tuple[int, int],
+                        preview: bool = False) -> None:  # device thread
+        if time.monotonic() - queued_at > MAX_PLAY_WAIT_S:
+            self._core.executor.submit(self._core.notice, PLAY_DROPPED, "hint")
+            return
+        try:
+            if preview:
+                self._core.engine.play(sound_id, volume=gain, monitor_only=True)
+            else:
+                self._core.engine.play(sound_id, volume=gain)
+        except KeyError:
+            return  # forgotten between is_loaded and play (deleted)
+        except Exception:
+            log.exception("playback of %s failed", sound_id)
+            self._core.executor.submit(self._core.notice, PLAY_FAILED, "hint")
+            return
+        self._core.executor.submit(self._started, sound_id, needle, token)
+
+    def _started(self, sound_id: str, needle: float, token: tuple[int, int]) -> None:  # core
+        if config.find_sound(self._core.store.data, sound_id) is None:
+            return  # the sound was deleted while the play was in flight
+        if token != (self._poll_gen, self._play_seq.get(sound_id, 0)):
+            return  # a Stop(sound_id) or StopAll landed after this play was submitted
+        self.playing.add(sound_id)
+        self._core.emit(PlaybackStarted(sound_id, needle))
+        self._core.state_changed()
+        if not self._polling:
+            self._polling = True
+            self._core.executor.call_later(POLL_S, self._request_poll, self._poll_gen)
+
+    def _request_poll(self, gen: int) -> None:  # core timer
+        if gen != self._poll_gen:
+            return
+        self._core.devices.submit(self._poll_on_device, gen)
+
+    def _poll_on_device(self, gen: int) -> None:  # device thread
+        try:
+            still = self._core.engine.playing_ids()
+        except Exception:
+            log.exception("polling playing_ids failed")
+            still = set()
+        self._core.executor.submit(self._polled, gen, still)
+
+    def _polled(self, gen: int, still: set[str]) -> None:  # core
+        if gen != self._poll_gen:
+            return
+        ended = self.playing - still
+        self.playing &= still
+        for sound_id in sorted(ended):
+            self._core.emit(PlaybackEnded(sound_id))
+        if ended:
+            self._core.state_changed()
+        if self.playing:
+            self._core.executor.call_later(POLL_S, self._request_poll, gen)
+        else:
+            self._polling = False
+
+    # ---- stopping ----
+
+    def stop(self, sound_id: str) -> None:
+        self._pending.pop(sound_id, None)
+        self._play_seq[sound_id] = self._play_seq.get(sound_id, 0) + 1
+        self._core.devices.submit(self._core.engine.stop, sound_id)
+        if sound_id in self.playing:
+            self.playing.discard(sound_id)
+            self._core.emit(PlaybackEnded(sound_id))
+            self._core.state_changed()
+
+    def stop_all(self) -> None:
+        self._pending.clear()
+        self._poll_gen += 1
+        self._polling = False
+        ended = sorted(self.playing)
+        self.playing.clear()
+        self._core.devices.submit(self._core.engine.stop_all)
+        for sound_id in ended:
+            self._core.emit(PlaybackEnded(sound_id))
+        if ended:
+            self._core.state_changed()
+
+    def forget(self, sound_id: str) -> None:
+        """A sound was deleted: drop everything playback knows about it."""
+        self._pending.pop(sound_id, None)
+        self.missing.discard(sound_id)
+        self._core.engine.forget(sound_id)
+
+    def _hint_missing(self, sound_id: str) -> None:
+        sound = config.find_sound(self._core.store.data, sound_id)
+        self._core.notice(MISSING.format(name=sound["name"] if sound else "Sound"))

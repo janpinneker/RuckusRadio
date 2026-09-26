@@ -1,0 +1,78 @@
+<#
+.SYNOPSIS
+    Builds dist\RuckusRadio.exe — a standalone, windowed onefile .exe.
+
+.DESCRIPTION
+    Creates/uses .\venv, installs requirements.txt, fetches ffmpeg.exe +
+    ffprobe.exe into assets\ (from Gyan's "essentials" build — demux/decode
+    MP3+MP4/AAC and encode MP3 via libmp3lame, ~98 MB/binary instead of the
+    ~212 MB/binary "full" build with every codec) if they aren't already
+    there, generates assets\icon.ico if missing, then runs
+    `pyinstaller build.spec --noconfirm`.
+#>
+$ErrorActionPreference = "Stop"
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $root
+
+$venvPython = Join-Path $root "venv\Scripts\python.exe"
+if (-not (Test-Path $venvPython)) {
+    Write-Output "Creating venv..."
+    python -m venv venv
+}
+
+Write-Output "Installing dependencies..."
+& $venvPython -m pip install --disable-pip-version-check -q -r requirements.txt
+
+$assetsDir = Join-Path $root "assets"
+New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
+$ffmpegDest = Join-Path $assetsDir "ffmpeg.exe"
+$ffprobeDest = Join-Path $assetsDir "ffprobe.exe"
+if (-not (Test-Path $ffmpegDest) -or -not (Test-Path $ffprobeDest)) {
+    Write-Output "ffmpeg.exe/ffprobe.exe missing from assets\, fetching Gyan's essentials build..."
+    $essentialsUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+    $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ruckus-ffmpeg-" + [Guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    $zipPath = Join-Path $tmpDir "ffmpeg-essentials.zip"
+    $downloaded = $false
+    try {
+        Write-Output "Downloading $essentialsUrl ..."
+        Invoke-WebRequest -Uri $essentialsUrl -OutFile $zipPath -UseBasicParsing
+        Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
+        $ffmpegSrc = Get-ChildItem $tmpDir -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
+        $ffprobeSrc = Get-ChildItem $tmpDir -Filter "ffprobe.exe" -Recurse | Select-Object -First 1
+        if (-not $ffmpegSrc -or -not $ffprobeSrc) {
+            throw "ffmpeg.exe/ffprobe.exe not found inside the downloaded essentials build."
+        }
+        Copy-Item $ffmpegSrc.FullName $ffmpegDest -Force
+        Copy-Item $ffprobeSrc.FullName $ffprobeDest -Force
+        $downloaded = $true
+        Write-Output "Fetched ffmpeg/ffprobe (essentials build) into assets\"
+    } catch {
+        Write-Warning "Essentials download failed ($_). Falling back to the winget Gyan.FFmpeg install (larger, includes every codec)."
+    } finally {
+        Remove-Item -Recurse -Force $tmpDir -Confirm:$false -ErrorAction SilentlyContinue
+    }
+
+    if (-not $downloaded) {
+        $wingetRoot = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        $found = Get-ChildItem $wingetRoot -Filter "ffmpeg.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $found) {
+            throw "Could not fetch ffmpeg-release-essentials.zip and no winget Gyan.FFmpeg install was found under $wingetRoot. Install it with 'winget install Gyan.FFmpeg', or download https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip yourself and copy ffmpeg.exe + ffprobe.exe into assets\ (see README.md)."
+        }
+        $srcDir = $found.DirectoryName
+        Write-Output "Copying ffmpeg/ffprobe from $srcDir (winget fallback)"
+        Copy-Item (Join-Path $srcDir "ffmpeg.exe") $ffmpegDest -Force
+        Copy-Item (Join-Path $srcDir "ffprobe.exe") $ffprobeDest -Force
+    }
+}
+
+$iconPath = Join-Path $assetsDir "icon.ico"
+if (-not (Test-Path $iconPath)) {
+    Write-Output "Generating assets\icon.ico..."
+    & $venvPython tools\make_icon.py
+}
+
+Write-Output "Running PyInstaller..."
+& (Join-Path $root "venv\Scripts\pyinstaller.exe") build.spec --noconfirm
+
+Write-Output "Done: dist\RuckusRadio.exe"

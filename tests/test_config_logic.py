@@ -1,0 +1,205 @@
+"""Config-Migration auf den outputs-Schluessel, ohne die echte %APPDATA%-Datei."""
+
+import os
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+_TMP = tempfile.mkdtemp(prefix="ruckus-config-")
+os.environ["RUCKUS_DATA_DIR"] = _TMP
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from soundboard import config  # noqa: E402
+
+
+def test_fresh_config_has_outputs():
+    fresh = config._default_config()
+    assert fresh["outputs"] == {}, fresh
+    assert "output_mode" not in fresh
+    assert "mic_passthrough" not in fresh
+    assert "monitor_volume" not in fresh, "the dock's Mithören slider is gone; the " \
+        "Kopfhörer row on Einstellungen is the only place this volume lives now"
+    print("fresh config has outputs: OK")
+
+
+def test_old_config_keeps_working():
+    """A config.json written before this feature must not crash and must not lose values."""
+    old = {
+        "version": 1,
+        "onboarding_completed": True,
+        "output_mode": "auto",
+        "mic_passthrough": True,
+        "mic_gain": 0.8,
+        "monitor_device": "default",
+        "monitor_volume": 0.056,
+        "sounds": [],
+    }
+    merged = config._with_defaults(old)
+    monitor = merged["outputs"][config.MONITOR_KEY]
+    assert monitor["sounds"] is True
+    # Version 2 resets the headphone level too (it was hand-tuned for unnormalized
+    # audio, same as the per-sound volumes), so the migrated monitor_volume does not
+    # survive - the monitor row ends up at the app default instead.
+    assert monitor["sounds_gain"] == config.DEFAULT_MONITOR_OUTPUT["sounds_gain"], monitor
+    assert monitor["mic"] is False, "hearing yourself is off unless asked for"
+    assert monitor["mic_gain"] == 0.0
+    # The old global values survive as the default for cables that appear later.
+    assert abs(merged["default_mic_gain"] - 0.8) < 1e-9, merged
+    assert merged["default_mic"] is True
+    # The dock's old "Mithören" slider is gone: the value is copied into the monitor
+    # row first, then reset to the app default there by _migrate_levels (checked
+    # above) - but the top-level key itself must not survive.
+    assert "monitor_volume" not in merged, merged
+    print("old config keeps working: OK")
+
+
+def test_migration_is_idempotent():
+    old = {"version": 1, "mic_gain": 0.8, "monitor_volume": 0.5, "sounds": []}
+    once = config._with_defaults(old)
+    assert "monitor_volume" not in once, once
+    once["outputs"][config.MONITOR_KEY]["sounds_gain"] = 0.25
+    twice = config._with_defaults(once)
+    assert twice["outputs"][config.MONITOR_KEY]["sounds_gain"] == 0.25, \
+        "a second load must not overwrite what the user changed"
+    assert "monitor_volume" not in twice, twice
+    print("migration is idempotent: OK")
+
+
+def test_load_config_oserror_keeps_app_startable():
+    path = config.config_path()
+    path.write_text("{}", encoding="utf-8")
+    with patch("soundboard.config.open", side_effect=OSError("config locked")):
+        loaded = config.load_config()
+    assert loaded == config._default_config(), loaded
+    assert path.exists(), "a read failure must not overwrite the original config"
+    print("load_config handles read OSError: OK")
+
+
+def test_output_settings_defaults():
+    cfg = config._default_config()
+    cable = config.output_settings(cfg, "CABLE Output (VB-Audio Virtual Cable)")
+    assert cable == {"mic": True, "mic_gain": 1.0, "sounds": True, "sounds_gain": 1.0}, cable
+    monitor = config.output_settings(cfg, config.MONITOR_KEY, is_monitor=True)
+    assert monitor["mic"] is False and monitor["sounds"] is True, monitor
+    # Reading must not write.
+    assert cfg["outputs"] == {}, cfg["outputs"]
+    print("output_settings defaults: OK")
+
+
+def test_voicemeeter_starts_without_the_mic():
+    """VoiceMeeter mischt selbst. Wuerde Ruckus Radio dort das Mikrofon greifen, naehme
+    es VoiceMeeter das Mikrofon weg - deshalb ist es aus, bis der Nutzer es anschaltet."""
+    cfg = config._default_config()
+    vm = config.output_settings(cfg, "Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)",
+                                is_voicemeeter=True)
+    assert vm["mic"] is False, vm
+    assert vm["sounds"] is True, "the sounds are the whole point of the target"
+    cable = config.output_settings(cfg, "CABLE Output (VB-Audio Virtual Cable)")
+    assert cable["mic"] is True, "a plain cable has nobody else to mix for it"
+    # Once the user switches it on, that choice wins over the default.
+    config.set_output_settings(cfg, "Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)", mic=True)
+    again = config.output_settings(cfg, "Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)",
+                                   is_voicemeeter=True)
+    assert again["mic"] is True, again
+    print("voicemeeter starts without the mic: OK")
+
+
+def test_set_output_settings_clamps():
+    cfg = config._default_config()
+    got = config.set_output_settings(cfg, "CABLE Output", sounds_gain=3.0, mic=False)
+    assert got["sounds_gain"] == config.MAX_OUTPUT_GAIN, got
+    assert got["mic"] is False
+    assert cfg["outputs"]["CABLE Output"]["sounds_gain"] == config.MAX_OUTPUT_GAIN
+    assert config.set_output_settings(cfg, "CABLE Output", mic_gain=-1.0)["mic_gain"] == 0.0
+    assert config.set_output_settings(cfg, "CABLE Output", sounds_gain=float("nan"))["sounds_gain"] == 1.0
+    print("set_output_settings clamps: OK")
+
+
+def test_version_2_resets_the_hand_tuned_cable_gains():
+    """Vor Version 2 standen die Kabel-Sounds auf 2-6 %, weil nichts normalisiert war.
+    Mit Lautheitsmessung wuerden sie damit fast unhoerbar - also einmal neutral."""
+    cable_key = "CABLE Output (VB-Audio Virtual Cable)"
+    old = {
+        "version": 1,
+        "outputs": {
+            cable_key: {"mic": True, "mic_gain": 0.85, "sounds": True, "sounds_gain": 0.06},
+            config.MONITOR_KEY: {"mic": False, "mic_gain": 0.0, "sounds": True,
+                                 "sounds_gain": 0.11},
+        },
+        "sounds": [],
+    }
+    merged = config._with_defaults(old)
+    cable = merged["outputs"][cable_key]
+    assert cable["mic_gain"] == 1.0 and cable["sounds_gain"] == 1.0, cable
+    assert cable["mic"] is True and cable["sounds"] is True, "switches are kept"
+    assert merged["outputs"][config.MONITOR_KEY]["sounds_gain"] == 0.5, \
+        "the headphones were hand-tuned for unnormalized audio too and are reset " \
+        "to the app default, same as the cables"
+    assert merged["version"] == 2
+    assert merged["sounds_offset_db"] == -6.0
+    assert merged["ducking_enabled"] is True and merged["ducking_db"] == -6.0
+    merged["outputs"][cable_key]["sounds_gain"] = 0.7
+    again = config._with_defaults(merged)
+    assert again["outputs"][cable_key]["sounds_gain"] == 0.7, "version 2 is never reset again"
+    assert config._default_config()["version"] == 2
+    print("version 2 resets hand-tuned cable gains once: OK")
+
+
+def test_version_2_resets_per_sound_volumes():
+    """v1 users hand-tuned per-sound volume (0.02-0.5) to tame unnormalized songs.
+    Stacked with v2's loudness normalization, those volumes would bury the sound
+    20-40 dB under the voice - so every sound's volume is reset to neutral too,
+    once, alongside the cable and headphone gains."""
+    old = {
+        "version": 1,
+        "outputs": {
+            "CABLE Output (VB-Audio Virtual Cable)": {
+                "mic": True, "mic_gain": 0.85, "sounds": True, "sounds_gain": 0.06},
+            "Hi-Fi Cable Output (VB-Audio Hi-Fi Cable)": {
+                "mic": True, "mic_gain": 1.0, "sounds": True, "sounds_gain": 0.06},
+            config.MONITOR_KEY: {"mic": False, "mic_gain": 0.4568, "sounds": True,
+                                 "sounds_gain": 0.109},
+        },
+        "sounds": [
+            {"id": "a", "name": "x", "file": "sounds/a.mp3", "icon": "icons/a.png",
+             "hotkey": None, "volume": 0.02},
+            {"id": "b", "name": "y", "file": "sounds/b.mp3", "icon": "icons/b.png",
+             "hotkey": None, "volume": 1.4},
+        ],
+        "microphone_name": "Mikrofon (Endorfy Solum Voice S Mic)",
+    }
+    merged = config._with_defaults(old)
+    sound_a, sound_b = merged["sounds"]
+    assert sound_a["volume"] == 1.0, sound_a
+    assert sound_b["volume"] == 1.0, sound_b
+    assert sound_a["id"] == "a" and sound_a["name"] == "x", "other keys untouched"
+    assert sound_a["file"] == "sounds/a.mp3" and sound_a["icon"] == "icons/a.png"
+    assert sound_a["hotkey"] is None
+    monitor = merged["outputs"][config.MONITOR_KEY]
+    assert monitor["sounds_gain"] == 0.5, monitor
+    assert monitor["mic_gain"] == 0.4568, "only sounds_gain is reset on the monitor"
+    assert merged["microphone_name"] == "Mikrofon (Endorfy Solum Voice S Mic)"
+
+    # v2 is never reset again: a hand-tuned volume set after migration must survive.
+    merged["sounds"][0]["volume"] = 0.3
+    again = config._with_defaults(merged)
+    assert again["sounds"][0]["volume"] == 0.3, "version 2 is never reset again"
+    print("version 2 resets per-sound volumes once: OK")
+
+
+def main():
+    test_fresh_config_has_outputs()
+    test_old_config_keeps_working()
+    test_migration_is_idempotent()
+    test_load_config_oserror_keeps_app_startable()
+    test_output_settings_defaults()
+    test_voicemeeter_starts_without_the_mic()
+    test_set_output_settings_clamps()
+    test_version_2_resets_the_hand_tuned_cable_gains()
+    test_version_2_resets_per_sound_volumes()
+    print("\nALL CONFIG LOGIC CHECKS PASSED")
+
+
+if __name__ == "__main__":
+    main()
