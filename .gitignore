@@ -1,13 +1,30 @@
 venv/
 __pycache__/
 *.pyc
+# Never commit credentials: the Spotify refresh token (and a config that carries the
+# client id) live under %APPDATA%\Soundboard. This guard only fires if someone points
+# RUCKUS_DATA_DIR at the checkout - which is exactly when it would go wrong.
+config.json
+secrets.json
+spotify_token.json
 tests/output/
 build/
 dist/
 .superpowers/
+.agents/
 assets/*.exe
 installer/Output/
 release-private.txt
 .firecrawl/
 webui/node_modules/
 webui/dist/
+
+# Lokal, nicht im Repository (Entscheidung 2026-09-27, siehe AGENTS.md)
+.impeccable/review/
+icon inspiration/
+banner inspo/
+wise design inspo/
+tools/make_cover_icon.py
+docs/scrape_voicebox_docs.py
+docs/voicebox-docs.md
+docs/voicebox-vorbereitung.md

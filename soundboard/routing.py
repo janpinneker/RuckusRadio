@@ -17,9 +17,9 @@ from typing import Callable
 
 from . import config, defaultdevice, devices, levels, miccheck, sinkgroup
 from .layout import output_rows, virtual_mic_status
-from .protocol import (DevicesChanged, HeadphonesSwitched, Rescan, RunSignalCheck, SetLevels,
-                       SetMicrophone, SetOnboardingActive, SetOutput, SignalCheckDone,
-                       ToggleMicMute)
+from .protocol import (DevicesChanged, HeadphonesSwitched, Rescan, RunSignalCheck,
+                       SetDiscordOutput, SetLevels, SetMicrophone, SetOnboardingActive,
+                       SetOutput, SignalCheckDone, ToggleMicMute)
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +87,7 @@ class RoutingService:
         core.handle(SetOutput, self.set_output)
         core.handle(SetLevels, self.set_levels)
         core.handle(SetMicrophone, self.set_microphone)
+        core.handle(SetDiscordOutput, self.set_discord_output)
         core.handle(ToggleMicMute, self.toggle_mic)
         core.handle(RunSignalCheck, self.run_signal_check)
         core.handle(Rescan, lambda _cmd: self.rescan())
@@ -187,11 +188,17 @@ class RoutingService:
         if sink is not None:
             sink.stop()
         self._core.engine.sink = None
+        if self._core.musicbus is not None:
+            self._core.musicbus.attach_sink(None)
 
     def _install_sink(self, cfg: dict, resolved: dict):  # device
         sink = self._backend.build_sink(cfg, resolved)
         if sink is not None:
             sink.set_mic_muted(self._dev_muted)
+        # Musik-Bus (Spec "musik-bus-kern" §4/§6.1): der on_block-Haken muss bei
+        # JEDEM Neuaufbau erneut gesetzt werden, sonst verstummt die Musik still.
+        if self._core.musicbus is not None:
+            self._core.musicbus.attach_sink(sink)
         engine = self._core.engine
         engine.voicemeeter_device = resolved.get("voicemeeter")
         engine.monitor_device = resolved.get("monitor")
@@ -225,7 +232,7 @@ class RoutingService:
             "found": bool(virtual.get("connected")),
             "name": virtual.get("out_name"),
             "label": virtual.get("label"),
-            "discord_device_name": virtual.get("discord_device_name"),
+            "discord_device_name": self._discord_device_name(),
             "mic_name": self.resolved.get("mic_name"),
             "monitor_name": self.resolved.get("monitor_name"),
             "mixer_running": self.mixer_running,
@@ -301,6 +308,20 @@ class RoutingService:
             self._core.notice(MIC_OK.format(name=name) if ok else MIC_FAILED.format(name=name))
 
         self.rescan(followup=report)
+
+    def set_discord_output(self, cmd: SetDiscordOutput) -> None:
+        self.cfg["discord_output"] = cmd.key or None
+        self._core.store.save_now()
+        self._core.state_changed()
+
+    def _discord_device_name(self) -> str | None:
+        """The cable Discord records from: the user's choice while that cable exists,
+        otherwise the primary cable (the old guess). Headphones never count."""
+        chosen = self.cfg.get("discord_output")
+        cables = {pair["key"] for pair in self.resolved.get("virtual_mics") or []}
+        if chosen and chosen in cables:
+            return chosen
+        return (self.resolved.get("virtual_mic") or {}).get("discord_device_name")
 
     def set_onboarding_active(self, cmd: SetOnboardingActive) -> None:
         self.onboarding_active = bool(cmd.active)
@@ -428,7 +449,7 @@ class RoutingService:
             "busy": self.busy,
             "found": bool(virtual.get("connected")),
             "name": virtual.get("out_name"),
-            "discord_device_name": virtual.get("discord_device_name"),
+            "discord_device_name": self._discord_device_name(),
             "virtual_mic_label": virtual.get("label"),
             "output_rows": output_rows(self.resolved, self.cfg),
             "microphones": list(self.resolved.get("microphones") or []),

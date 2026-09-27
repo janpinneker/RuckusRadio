@@ -714,50 +714,30 @@ def test_update_button_asks_and_installs():
 
 
 def test_launch_update_starts_the_installer_and_closes_without_asking():
+    # The actual Popen/env/log-path mechanics live in updates.launch_installer now
+    # (tests/test_updates_logic.py); this only checks gui.launch_update's own wiring:
+    # hand the path to the shared launcher, close on success, show an error and stay
+    # open on failure - no microphone question either way, the user already agreed.
     app, c, events = make_app()
-    started: list[list[str]] = []
-    kwargs: list[dict] = []
-    original_popen = gui.subprocess.Popen  # the real one: ffmpeg needs it in later tests
     closed: list[bool] = []
     app.shutdown_and_close = lambda: closed.append(True)
-
-    def fake_popen(args, **kw):
-        started.append(args)
-        kwargs.append(kw)
-
-    def boom(args, **kw):
-        raise OSError("blocked")
-
-    # a fake PyInstaller onefile marker: launch_update must strip it, not pass it on to the
-    # installer's relaunch of Ruckus (else the bootloader treats itself as a dead process's child)
-    old_pyi = os.environ.get("_PYI_ARCHIVE_FILE")
-    os.environ["_PYI_ARCHIVE_FILE"] = "C:/fake/RuckusRadio.exe"
+    calls: list[str] = []
+    original_launch = gui.launch_installer
     try:
-        gui.subprocess.Popen = fake_popen
+        gui.launch_installer = lambda path: calls.append(path) or True
         app.launch_update("C:/tmp/RuckusRadioSetup-9.0.0.exe")
-        expected_log = Path("C:/tmp/RuckusRadioSetup-9.0.0.exe").with_name("install.log")
-        assert started == [["C:/tmp/RuckusRadioSetup-9.0.0.exe", "/VERYSILENT",
-                            "/SUPPRESSMSGBOXES", "/NORESTART", "/UPDATE",
-                            f"/LOG={expected_log}"]]
+        assert calls == ["C:/tmp/RuckusRadioSetup-9.0.0.exe"]
         assert closed == [True], "no microphone question: the user already agreed"
-        env = kwargs[0]["env"]
-        assert not [k for k in env if k.startswith("_PYI_")], \
-            "PyInstaller onefile markers must not reach the relaunched exe"
-        assert env["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
         MESSAGES.clear()
-        gui.subprocess.Popen = boom
+        gui.launch_installer = lambda path: False
         closed.clear()
         app.launch_update("C:/tmp/x.exe")
         assert closed == [] and MESSAGES and MESSAGES[-1][0] == "error"
     finally:
-        gui.subprocess.Popen = original_popen
-        if old_pyi is None:
-            os.environ.pop("_PYI_ARCHIVE_FILE", None)
-        else:
-            os.environ["_PYI_ARCHIVE_FILE"] = old_pyi
+        gui.launch_installer = original_launch
     app.destroy()
-    print("the installer starts detached with a clean env and an install log, "
-          "Ruckus closes; a failed start keeps it open: OK")
+    print("launch_update hands the path to the shared launcher and closes on success, "
+          "a failed start keeps it open: OK")
 
 
 def test_pump_stops_once_a_callback_closes_the_app():

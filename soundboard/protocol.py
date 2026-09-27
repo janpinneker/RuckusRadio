@@ -34,6 +34,11 @@ class Command:
 
 class Event:
     kind: ClassVar[str] = "event"
+    # Deklariertes Zusammenfassen: sag selbst, ob ein neueres Ereignis desselben Typs
+    # ein älteres im selben Bündel ersetzt, und wodurch es sich unterscheidet. Die
+    # Brücke pflegt damit keine Liste von Ereignisnamen.
+    coalesce: ClassVar[bool] = False
+    coalesce_by: ClassVar[tuple[str, ...]] = ()
 
 
 def message(cls: type) -> type:
@@ -149,6 +154,13 @@ class SetMicrophone(Command):
 
 
 @message
+class SetDiscordOutput(Command):
+    """Which cable Discord records from (an output row key); "" = the primary cable.
+    Ruckus cannot read Discord's input device, so with two cables the user names it."""
+    key: str
+
+
+@message
 class ToggleMicMute(Command):
     pass
 
@@ -188,11 +200,111 @@ class InstallUpdate(Command):
     pass
 
 
+@message
+class RegenerateViewToken(Command):
+    """Neuer Ansichtsschlüssel (Spec §7). Alte Links und offene Ansichten hören auf."""
+    pass
+
+
+# ---- requests: the page asks, Python opens the dialog (spec §9) ----
+# The interface never sends a file path; it asks for a file and the core chooses it.
+
+@message
+class RequestAddSound(Command):
+    pass
+
+
+@message
+class RequestImportPack(Command):
+    pass
+
+
+@message
+class RequestExportSounds(Command):
+    sound_id: str | None = None
+
+
+@message
+class RequestSetSoundIcon(Command):
+    sound_id: str
+
+
+@message
+class SetMusicBus(Command):
+    """Musik-Bus an/aus: der Ton anderer Apps wird mitgeschnitten und klingt fuer
+    andere wie ein Sound (Spec "musik-bus-kern"). Transport wie Play/Stop."""
+
+    enabled: bool
+
+
+@message
+class SetMusicBusGain(Command):
+    gain: float
+
+
+@message
+class SpotifyLogin(Command):
+    pass
+
+
+@message
+class SpotifyLogout(Command):
+    pass
+
+
+@message
+class SpotifySearch(Command):
+    query: str
+    search_type: str = "track"  # track | album | playlist | artist
+    offset: int = 0
+
+
+@message
+class SpotifySearchMore(Command):
+    """The next page of the same search ("mehr laden")."""
+
+    query: str
+    search_type: str
+    offset: int
+
+
+@message
+class SpotifyLoadLibrary(Command):
+    pass
+
+
+@message
+class SpotifyLoadPlaylist(Command):
+    playlist_id: str
+    offset: int = 0
+
+
 # ---- events: core -> interface ----
 
 @message
 class StateChanged(Event):
     state: dict
+    coalesce: ClassVar[bool] = True
+
+
+@message
+class PartChanged(Event):
+    """Eine Zustandsgruppe, die sich selten ändert (die Bibliothek wächst, der
+    flüchtige Teil nicht). Getrennt von StateChanged, damit die Sekundenlast nicht
+    mit der Bibliothek wächst. Ersetzt sich je Gruppe, nicht global."""
+    group: str
+    part: dict
+    coalesce: ClassVar[bool] = True
+    coalesce_by: ClassVar[tuple[str, ...]] = ("group",)
+
+
+@message
+class JobChanged(Event):
+    """One job's state after a change. Jobs replace themselves per id, so a fast job
+    does not flood the batch. Lives in the volatile group (they come and go)."""
+    job: dict
+    coalesce: ClassVar[bool] = True
+    coalesce_by: ClassVar[tuple[str, ...]] = ("id",)
 
 
 @message
@@ -243,6 +355,18 @@ class UpdateReady(Event):
 
 
 @message
+class SpotifyAuthChanged(Event):
+    connected: bool
+    user_name: str = ""
+
+
+@message
+class SpotifyError(Event):
+    message: str
+    level: str = "error"
+
+
+@message
 class Notice(Event):
     """hint: one line in the status bar; info/error: a dialog the user confirms."""
 
@@ -255,6 +379,23 @@ class Notice(Event):
 
 
 # ---- JSON ----
+
+def coalesce_key(message: dict) -> str | None:
+    """Der Schlüssel, unter dem ein eingereihtes Ereignis ein älteres ersetzt - oder
+    None, wenn es nicht zusammengefasst wird. Rein und damit leicht zu testen."""
+    cls = _REGISTRY.get(message.get("type"))
+    if cls is None or not getattr(cls, "coalesce", False):
+        return None
+    by = getattr(cls, "coalesce_by", ())
+    if not by:
+        return message["type"]
+    data = message.get("data") or {}
+    # A field may sit at the top level (PartChanged.group) or inside a payload the event
+    # carries (JobChanged.job.id) - both are declared with the same key.
+    return message["type"] + ":" + "|".join(
+        str(data.get(field) if field in data else (data.get("job") or {}).get(field))
+        for field in by)
+
 
 def _check(value: Any, path: str) -> Any:
     """Validate a JSON value; tuples become lists on the way out."""

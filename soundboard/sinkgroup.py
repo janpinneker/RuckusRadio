@@ -127,6 +127,11 @@ class Target:
         # that nothing refills, inflating starved_blocks for as long as the mute lasts.
         self._mic_muted = False
         self._mic_queue: queue.Queue = queue.Queue(maxsize=MIC_QUEUE_BLOCKS)
+        # Musik-Bus (Spec "musik-bus-kern" §4): eigene Queue wie beim Mikrofon,
+        # abgelegt wird in den Sound-Zweig (chunks), damit Offset/Ducking/Limiter
+        # wirken - nur der Kopfhoerer bleibt unreguliert.
+        self._music_queue: queue.Queue = queue.Queue(maxsize=MIC_QUEUE_BLOCKS)
+        self.dropped_music = 0  # Musik-Blöcke, die einem langsamen Ziel geopfert wurden
         self._sources: list[MixSource] = []
         self._lock = threading.Lock()
         self._stream = None
@@ -184,11 +189,21 @@ class Target:
             log.debug("closing the stream for %s failed", self.key, exc_info=True)
 
     def apply(self, settings: dict) -> None:
-        """Take new settings and open or close the stream to match."""
+        """Take new settings and open or close the stream to match. Sounds that are
+        already playing follow at once: a level change rescales them, switching the
+        sounds off drops them from this target (the other targets keep playing)."""
+        old_gain = self.sounds_gain
         self.mic = bool(settings["mic"])
         self.mic_gain = float(settings["mic_gain"])
         self.sounds = bool(settings["sounds"])
         self.sounds_gain = float(settings["sounds_gain"])
+        if not self.sounds:
+            self.clear_sources()
+        elif self.sounds_gain != old_gain and old_gain > 0:
+            ratio = self.sounds_gain / old_gain
+            with self._lock:
+                for source in self._sources:
+                    source.gain *= ratio
         if self.wants_stream:
             self.open()
         else:
@@ -240,6 +255,21 @@ class Target:
                 pass
             self.dropped_blocks += 1
 
+    # ---- music (music bus thread) ----
+
+    def push_music(self, block: np.ndarray) -> None:
+        """Called from SinkGroup.distribute_music, once per sounds-enabled target."""
+        try:
+            self._music_queue.put_nowait(block)
+        except queue.Full:
+            # Same rule as the mic queue: drop the oldest instead of growing latency.
+            try:
+                self._music_queue.get_nowait()
+                self._music_queue.put_nowait(block)
+            except (queue.Empty, queue.Full):
+                pass
+            self.dropped_music += 1
+
     # ---- callback (PortAudio thread) ----
 
     def _output_callback(self, outdata, frames, time_info, status) -> None:
@@ -263,6 +293,14 @@ class Target:
         if done:
             with self._lock:
                 self._sources = [s for s in self._sources if s not in done]
+
+        # Musik-Bus: genau ein Block pro Callback, in den Sound-Zweig (chunks) -
+        # mit dem Ziel-Gain wie jeder Sound, dann wirken Offset/Ducking/Limiter.
+        if self.sounds:
+            try:
+                chunks.append(self._music_queue.get_nowait() * self.sounds_gain)
+            except queue.Empty:
+                pass
 
         # The ducker runs every block, sound or not, so a sound that starts mid-sentence
         # is already ducked in its first block.
@@ -452,6 +490,14 @@ class SinkGroup:
             return
         for target in self.targets:
             target.push_mic(block)
+
+    def distribute_music(self, block: np.ndarray) -> None:
+        """Musik-Bus-Block an jedes Ziel, das Sounds hoert - Muster _distribute_mic,
+        eine Queue je Ziel, damit kein Ziel einem anderen Bloecke stiehlt. Laeuft
+        aus dem Abgriff-Faden des Musik-Buses auf."""
+        for target in self.targets:
+            if target.sounds:
+                target.push_music(block)
 
     # ---- mic controls (compat with the dock's mic-mute button, predating the matrix) ----
 

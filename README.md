@@ -45,7 +45,8 @@ Standardmäßig hört jedes Programm, das an einem virtuellen Kabel hängt, dies
 1. Zusätzlich zu VB-CABLE ein zweites Kabel installieren, z. B. das kostenlose [Hi-Fi Cable von VB-Audio](https://vb-audio.com/Cable/) — beide können parallel installiert sein.
 2. In CS als Mikrofon `CABLE Output (VB-Audio Virtual Cable)` einstellen, in Discord `Hi-Fi Cable Output (VB-Audio Hi-Fi Cable)` (oder umgekehrt) — jedes Programm bekommt sein eigenes Kabel als Eingabegerät.
 3. Auf der Seite **Einstellungen** in Ruckus Radio zeigt jedes gefundene Kabel seine eigene Zeile mit den Schaltern **Mikro** und **Sounds**. Beim Kabel, das Discord hört, **Sounds** ausschalten — es kommt dann nur noch deine Stimme an. Beim Kabel für CS bleiben beide Schalter an.
-4. Die **Kopfhörer**-Zeile ganz unten regelt nur dein eigenes Mithören, unabhängig von den Kabeln — schaltest du dort Sounds aus, hörst du deine eigenen Sounds nicht mehr mit, ohne dass CS oder Discord etwas davon merken.
+4. In den **Einstellungen → Verbindung** bei **„Discord hört über“** das Kabel wählen, das Discord als Eingabegerät nutzt. Ruckus kann Discords Einstellung nicht auslesen; ohne diese Wahl nimmt es das Haupt-Kabel an, und der Dock-Knopf „Discord: Sounds an/aus“ schaltet dann das falsche Kabel.
+5. Die **Kopfhörer**-Zeile ganz unten regelt nur dein eigenes Mithören, unabhängig von den Kabeln — schaltest du dort Sounds aus, hörst du deine eigenen Sounds nicht mehr mit, ohne dass CS oder Discord etwas davon merken.
 
 ## Mischpult: Stimme, Sounds und Lautstärke
 
@@ -62,6 +63,8 @@ Unter jedem Sound steht, was die Automatik gemacht hat, z. B. „auto −9 dB". 
 Empfohlene Windows-Einstellung für dein Mikro und die Kabel: **48000 Hz, 24 Bit** (Systemsteuerung → Sound → Aufnahme → Eigenschaften → Erweitert). Ruckus Radio und Discord arbeiten intern mit 48 kHz, 96 kHz bringt nichts.
 
 In Discord am Kabel, das Discord hört: **Krisp/Rauschunterdrückung aus, Echounterdrückung aus, automatische Verstärkungsregelung aus, „Eingangsempfindlichkeit automatisch bestimmen“ aus und den Regler ganz nach links**. Sonst filtert Discord die Sounds mit, und seine Sprachaktivierung schneidet leise Anfänge ab (Wortanfänge, ruhige Song-Intros). Die Stille in Pausen übernehmen NVIDIA Broadcast und Ruckus Radio.
+
+**Abgehackte Stimme mit NVIDIA Broadcast:** Ruckus reicht genau weiter, was NVIDIA Broadcast liefert (gemessen 2026-09-27). Zwei Dinge schneiden dort ab: ein **zu leiser Mikrofonpegel** (Windows → Sound → Eingabe → dein Mikro auf 90–100; bei −45 dB Sprachpegel hielt die Geräuschunterdrückung die Stimme für Rauschen) und die **Geräuschunterdrückung auf hoher Stärke**, die einen gleichmäßig gehaltenen Ton nach etwa 1,5–2 Sekunden hart ausblendet (lang gezogene Vokale). Normales Sprechen ist davon kaum betroffen; wer lange Töne braucht, senkt die Stärke etwas.
 
 ## Erster Start
 
@@ -92,6 +95,49 @@ Beim allerersten Start öffnet sich automatisch ein kurzer Einrichtungsassistent
 - **Discord: Sounds an/aus** — schaltet nur die Sounds im Discord-Kabel stumm; dein Mikro bleibt in Discord hörbar, CS/Steam hören die Sounds weiter.
 - **Prüfen** — schickt einen Ton durch das virtuelle Mikrofon und misst am anderen Ende, ob er ankommt. Das ist der einzige Test, der ohne Mitspieler beweist, dass die Gegenstelle dich hört. Schlägt er fehl, zeigt die Statusleiste „gefunden, aber kein Signal — prüfen" statt grün.
 - **Mikro an/aus** — nur im VB-CABLE-Modus: schaltet dein Mikrofon stumm, die Sounds laufen weiter.
+
+## Spotify im Musik-Tab
+
+Im Bereich **Musik** kann Ruckus deine Spotify-Bibliothek durchsuchen, gespeicherte Titel und eigene Playlists ansehen und (ab F2) die Wiedergabe steuern. Ruckus spricht direkt mit der **Spotify Web API**; es braucht kein Zusatzprogramm.
+
+**Einmalig einrichten** — auf https://developer.spotify.com/dashboard eine App anlegen (kostenlos, Spotify-Konto genügt). Das Formular so ausfüllen:
+
+| Feld | Eingabe |
+|---|---|
+| App name | z. B. `Ruckus Radio` |
+| App description | z. B. `Steuert die Spotify-Wiedergabe und zeigt die eigene Bibliothek.` |
+| Website | darf **leer bleiben** (sonst z. B. `https://github.com/janpinneker/RuckusRadio`) |
+| **Redirect URI** | `http://127.0.0.1:47800/callback` → **Add** → danach unten **Save** (ohne Save ist er nicht gespeichert) |
+| Which API/SDKs are you planning to use? | **nur „Web API“** ankreuzen |
+
+1. Danach unter *Settings* die **Client ID** kopieren und in `%APPDATA%\Soundboard\config.json` als `spotify_client_id` eintragen — oder als Windows-Benutzervariable `RUCKUS_SPOTIFY_CLIENT_ID` setzen.
+2. Unter *Settings → User Management* die Spotify-Konten eintragen, die sich anmelden dürfen (Name **und** E-Mail des Spotify-Kontos). Die App läuft im **Development mode** und lässt nur diese Konten zu — seit Februar 2026 sind das **5** (früher 25).
+3. Ruckus neu starten, im Musik-Tab auf **„Mit Spotify verbinden“** klicken und im Browser bestätigen. Die Weiterleitung landet auf der Route `/callback` des lokalen Servers (`127.0.0.1:47800`) — es gibt keinen zweiten Listener; die Route lebt nur während der Anmeldung und wird danach wieder entfernt.
+
+**Ruckus beim Eintragen der Client ID schließen.** Eine laufende Ruckus-Instanz schreibt `config.json` beim Speichern selbst neu, und ein **älterer** Build kennt `spotify_client_id` noch nicht — er würde den Eintrag wieder entfernen. Wer das ganz umgehen will, nimmt die Windows-Benutzervariable `RUCKUS_SPOTIFY_CLIENT_ID`; die kann kein Programm überschreiben.
+
+**Kein SDK, kein Client-Secret.** Ruckus nutzt ausschließlich die **Spotify Web API** (REST über HTTPS) und den **Authorization Code Flow mit PKCE** — ein eigenes SDK gibt es dafür nicht, Python ruft die API direkt auf (`urllib`, schon im Projekt). Das **Web Playback SDK** wird bewusst nicht verwendet: Es braucht Widevine, das WebView2 nicht mitbringt (deshalb Variante A, Ton aus der Spotify-Desktop-App). Ein Client-Secret brauchen öffentliche PKCE-Clients nicht — und es gehört ohnehin nie ins Repo.
+
+**Wichtig:**
+
+- **Premium ist Pflicht, nicht nur fürs Abspielen.** Seit der Spotify-Umstellung vom **11.02.2026** (für bestehende Apps ab 09.03.2026) muss der **App-Besitzer** ein **aktives** Premium-Abo haben — läuft es aus, stellt Spotify die App komplett ab, auch Suche und Bibliothek. Wiedergabe-Steuerung (F2) braucht Premium ohnehin. Dazu: **1 Client-ID je Entwickler** (Juli 2026 auf 25 erhöht) und **5 autorisierte Nutzer** je Client-ID.
+- **Spotify hat die Web API im Februar 2026 zusammengestrichen.** Ruckus ist darauf eingestellt: Eine Suche liefert höchstens **10** Treffer pro Anfrage (Ruckus blättert nach), Playlists tragen intern `items` statt `tracks`, und **Playlist-Inhalte kommen nur noch von eigenen oder mitbearbeiteten Playlists** — fremde Playlists erscheinen nur mit Name und Cover. Bibliothek (gespeicherte Titel/Alben/Playlists), Suche und die Player-Befehle für F2 bleiben verfügbar.
+- **Der Ton kommt aus der Spotify-App**, nicht aus Ruckus: Ruckus ist nur Fernbedienung. Auf dem PC die Spotify-Desktop-App öffnen, dann erscheint sie als Gerät.
+- **Musik ins virtuelle Mikrofon (Musik-Bus): der Kern ist verdrahtet** (Stand 2026-09-27, Spec `docs/superpowers/specs/2026-09-27-musik-bus-kern-design.md`): Befehle `SetMusicBus`/`SetMusicBusGain`, Zustandsteil `musicbus`, Config `musicbus_enabled`/`musicbus_gain`, und der Ton läuft per WASAPI-Loopback **wie ein Sound** in die Kabel — mit „Sounds unter Stimme“, Ducking und Limiter, die Kopfhörer bleiben unreguliert. Schalter und Regler stehen auf der **Musik-Seite** („Musik ins Mikrofon“, auch im Steam-Overlay-Browser). **Offen:** der Hörtest mit echtem Ton. Bis dahin bleibt der Musik-Tab reines Mithören. Der Sofort-Weg ohne Ruckus: Windows → Einstellungen → System → Sound → Lautstärkemixer → Spotify auf `CABLE Input` stellen — dann hören Discord/Steam die Musik, aber ohne Ducking, ohne Ruckus-Regler und „Alle stoppen“ stoppt sie nicht.
+- Der **Anmeldeschlüssel** (Refresh-Token) liegt im gemeinsamen Secrets-Speicher `%APPDATA%\Soundboard\secrets.json` (Eintrag `spotify_token`) und wird nie an die Oberfläche oder ins Log gegeben — geloggt werden nur Name und Länge. Abmelden über den Musik-Tab löscht ihn. Wer noch die alte `spotify_token.json` hat: sie wird beim Start einmalig übernommen und danach entfernt.
+- **Die Oberfläche muss laufen.** Die Anmeldung braucht den lokalen Server; im reinen Tk-Fenster meldet Ruckus das, statt auf einem zweiten Port zu lauschen, den Spotify nicht kennt. Ist der Serverport belegt und die Oberfläche weicht aus, sagt Ruckus das ebenfalls im Klartext — Spotify erlaubt nur die eingetragene Adresse, ein Ausweichport würde erst später als `redirect_uri mismatch` auffallen.
+- Die Redirect-Adresse muss **genau** dieser Loopback-IP entsprechen. `http://localhost:…` ist bei Spotify seit November 2025 **nicht mehr erlaubt** (HTTP nur noch für Loopback-IP-Literale wie `127.0.0.1`); die Portangabe darf bei Loopback-IP auch weggelassen werden, dann sind dynamische Ports erlaubt. Ruckus nutzt den festen Port 47800 (dieselbe Adresse wie die Oberfläche).
+- Die Client ID ist kein Geheimnis (PKCE ohne Client-Secret); im Repo steht sie nicht.
+
+**Anmeldung selbst prüfen** (braucht die Client ID, öffnet den echten Browser):
+
+```bash
+venv/Scripts/python.exe tests/test_spotify_manual.py
+```
+
+Das Skript prüft zuerst den Rückkanal auf `127.0.0.1:47800` (geht auch ohne Client ID), führt dann die echte Anmeldung durch und ruft Bibliothek, Suche und eine Playlist ab — es meldet die Stelle, an der es hakt. Zum Schluss hält es jeden Cover-Host aus dem Zustand gegen die `img-src`-Liste aus `webui/vite.config.ts`: ein Host, den die CSP nicht erlaubt, lässt es scheitern. Das ist die einzige Stelle, an der ein **neuer** Spotify-Bildhost sonst still ausfiele — der Browser blockiert ein Bild ohne Fehlermeldung, und die Oberfläche zeigt einfach ihren Ersatz-Cover.
+
+Scheitert die Anmeldung **sporadisch** mit einer Netz-Meldung, ist das kein Fehler in Ruckus: Spotifys Anmelde-Server schickt je nach Edge-Knoten ein unvollständiges Zertifikat, und Windows-Programme merken das nur nicht (sie haben das fehlende Zwischenzertifikat gespeichert). Die technische Ursache steht im Log; ein zweiter Versuch klappt.
 
 ## Sounds exportieren/importieren (`.ruckuspack`)
 
@@ -136,17 +182,25 @@ Hinweis: Die ffmpeg-Binaries werden bewusst nicht mit UPX komprimiert (PyInstall
 
 Das App-Icon (`assets\icon.ico`) wird aus den Design-Tokens in `soundboard\theme.py` generiert und lässt sich jederzeit neu erzeugen: `venv\Scripts\python.exe tools\make_icon.py`.
 
-Web-Oberfläche (Probe B0): `build.ps1` baut `webui/` mit Node.js (npm) mit, wenn der Ordner existiert. Start mit `RuckusRadio.exe --webui`; ohne Schalter startet die gewohnte Oberfläche. Zum Ausprobieren ohne echte Geräte: `cd webui && npm install && npm run dev`, dann http://localhost:5173 (Attrappe mit Beispiel-Sounds). Die Schrift Inter ist mitgeliefert (SIL OFL, siehe `THIRD-PARTY-LICENSES.md`); die Gestaltungsregeln stehen in `DESIGN.md`. Stand der Web-Oberfläche: Startseite mit Favoriten (eigene Seite „Favoriten“), Playlists und den meistgespielten Sounds (fest pro Sitzung; mehrfaches Klicken innerhalb von 2 Sekunden zählt als eine Benutzung); „Einstellungen“ sitzt unten links im Dock, so breit wie die Seitenleiste, mit einem Statuspunkt für das virtuelle Mikro (grün, gelb, rot – mit eigener Form je Zustand); „Prüfen“ liegt in Einstellungen → „Verbindung“; spielt ein Sound, zeigt das Dock eine Sound-Leiste mit Fortschritt und Stopp; Raster lassen sich mit den Pfeiltasten bedienen. Im Browser-Prototyp greifen die Hotkeys (Standard „Alle stoppen“: Strg+ß) nur, solange die Seite den Fokus hat; global hört sie erst die App.
+Web-Oberfläche (Probe B0, bis zur Umsetzung von „eine Oberfläche überall“): `build.ps1` baut `webui/` mit Node.js (npm) mit, wenn der Ordner existiert. Start mit `RuckusRadio.exe --webui`; ohne Schalter startet die gewohnte Oberfläche. Im Quelltext (Branch `feat/one-ui`) ist es bereits umgekehrt: ohne Schalter die Web-Oberfläche über den lokalen Server, `--tk` für die gewohnte, `--serve` startet nur den Server ohne Fenster. Zum Ausprobieren ohne echte Geräte: `cd webui && npm install && npm run dev`, dann http://localhost:5173 (Attrappe mit Beispiel-Sounds). Die Schrift Inter ist mitgeliefert (SIL OFL, siehe `THIRD-PARTY-LICENSES.md`); die Gestaltungsregeln stehen in `DESIGN.md`. Stand der Web-Oberfläche: Startseite mit Favoriten (eigene Seite „Favoriten“), Playlists und den meistgespielten Sounds (fest pro Sitzung; mehrfaches Klicken innerhalb von 2 Sekunden zählt als eine Benutzung); „Einstellungen“ sitzt unten links im Dock, so breit wie die Seitenleiste, mit einem Statuspunkt für das virtuelle Mikro (grün, gelb, rot – mit eigener Form je Zustand); „Prüfen“ liegt in Einstellungen → „Verbindung“; spielt ein Sound, zeigt das Dock eine Sound-Leiste mit Fortschritt und Stopp; Raster lassen sich mit den Pfeiltasten bedienen. Im Browser-Prototyp greifen die Hotkeys (Standard „Alle stoppen“: Strg+ß) nur, solange die Seite den Fokus hat; global hört sie erst die App.
 
-## Weiterentwicklung (Stand 2026-09-26)
+## Weiterentwicklung (Stand 2026-09-27)
 
-Geplant sind drei Bereiche: **Soundboard**, **Musik** (Bibliothek, Playlists, Wiedergabe in den Mixer) und **Blackbox** (Sprach-Studio über das separat installierte [Voicebox](https://github.com/jamiepine/voicebox)), dazu ein **Zuschnitt-Editor** für Sounds und Musik. Die Programmlogik liegt seit 2026-09-25 in einem eigenen App-Kern; die heutige Oberfläche zeigt nur an und schickt Befehle. Ruckus startet höchstens einmal und kann sich selbst aktualisieren (Abschnitt „Update“). Die neue Web-Oberfläche (React, dunkle Wise-Welt mit Lime-Akzent, Regeln in `DESIGN.md`) liegt im Ordner `webui/` auf dem Branch `feat/b0-webui` und ist als Klick-Prototyp im Browser fertig; der Messlauf am 2026-09-27 hat sie bestätigt (Fenster-Anpassen ≈ 1 ms statt ≈ 240 ms, Ton am Kabel und Hotkeys unverändert; Werte in `docs/superpowers/b0-messwerte.md`), sie wird also die neue Oberfläche. Bis sie fertig ausgebaut ist, startet Ruckus wie gewohnt, `RuckusRadio.exe --webui` öffnet sie zur Probe. Danach geplant: Nutzerkonten (Anmeldung, Profil auf jedem PC gleich), Zuschneiden, Ordner und Stichwörter im Kern, ein Downloader, m4a und ein Assistent, den man nicht erneut durchklicken muss.
+Für Agents, die am Projekt arbeiten: Arbeitsregeln, Lesereihenfolge und Skill-Lade-Wege stehen in [`AGENTS.md`](AGENTS.md).
+
+Geplant sind drei Bereiche: **Soundboard**, **Musik** (Bibliothek, Playlists, Wiedergabe in den Mixer) und **Blackbox** (Sprach-Studio über das separat installierte [Voicebox](https://github.com/jamiepine/voicebox)), dazu ein **Zuschnitt-Editor** für Sounds und Musik. Die Programmlogik liegt seit 2026-09-25 in einem eigenen App-Kern; die heutige Oberfläche zeigt nur an und schickt Befehle. Ruckus startet höchstens einmal und kann sich selbst aktualisieren (Abschnitt „Update“). Die neue Web-Oberfläche (React, dunkle Wise-Welt mit Lime-Akzent, Regeln in `DESIGN.md`) liegt im Ordner `webui/` und **ist die Oberfläche**: der Messlauf am 2026-09-27 hat sie bestätigt (Fenster-Anpassen ≈ 1 ms statt ≈ 240 ms, Ton am Kabel und Hotkeys unverändert; Werte in `docs/superpowers/b0-messwerte.md`). **Seit 2026-09-27 kann sie alles, was die gewohnte Tk-Oberfläche kann** — auch Sounds hinzufügen, Packs importieren/exportieren, Icon ändern, Mikrofon wählen, Mischpult, Geräte neu suchen, Autostart, Updates und den Assistenten (Dateidialoge öffnet weiterhin Python, die Seite übergibt nie Pfade). Die gewohnte Oberfläche bleibt nur noch als Rückfall (`RuckusRadio.exe --tk`). **Stand und Nächstes (Spec und Plan stehen; das Fundament, die Umstellung auf den Server und die Lücke zur gewohnten Oberfläche sind umgesetzt):** Die Web-Oberfläche wird Standard und lässt sich zusätzlich im Steam-Overlay-Browser bedienen, ohne das Spiel zu verlassen. Dafür bekommt Ruckus einen **lokalen Server auf `127.0.0.1`**: das Fenster lädt dieselbe Adresse wie der Browser, und beide sprechen denselben Weg (HTTP + Server-Sent-Events), also gibt es nur eine Codeschiene. Der Zugang ist über zwei Schlüssel getrennt — das Fenster darf alles, ein Browser-Link nur abspielen und zusehen. Die Adresse steht in den Einstellungen und funktioniert als Lesezeichen im Steam-Overlay. Die gewohnte Oberfläche bleibt als Rückfall (`--tk`), und `--serve` startet nur den Server ohne Fenster. Entwurf: `docs/superpowers/specs/2026-09-27-eine-oberflaeche-design.md`, Umsetzung: `docs/superpowers/plans/2026-09-27-eine-oberflaeche-kern-server.md`. Die Vorarbeit legt die Bausteine an, die Musik und Stimme später ohne Umbau brauchen. Der Plan, der die Lücke geschlossen hat (`docs/superpowers/plans/2026-09-27-eine-oberflaeche-oberflaeche.md`, 11 Tasks), ist bis auf die Handprüfung mit echten Geräten abgearbeitet; Fortschritt und Belege: `docs/superpowers/eine-oberflaeche-log.md`. Offen bleiben Ordner, Playlists und Stichwörter im Kern (Bibliothek 2.0, heute nur in der Attrappe).
+
+Die **Spotify-Anbindung im Musik-Tab** ist in der ersten Stufe fertig (F1: Anmeldung per OAuth-PKCE, Token-Speicher, Suche, gespeicherte Titel und Playlists, echte Cover-Bilder; Spec `docs/superpowers/specs/2026-09-27-spotify-musik-tab-design.md`, Plan `docs/superpowers/plans/2026-09-27-spotify-musik-tab.md`). Wiedergabe-Steuerung (F2) und Feinschliff (F3) folgen. Der Ton kommt über den **Musik-Bus** in den Mixer: die Technik steht (WASAPI-Loopback per ctypes/COM, `soundboard/musicbus.py`) und ist an den Kern verdrahtet (klingt für andere wie ein Sound). Die Schalter und der Pegelregler sitzen seit 2026-09-27 auf der Musik-Seite (`f15ac17`); offen ist nur der Hörtest mit echtem Ton (Ducking, Exclusive Mode). Bis dahin bedient der Musik-Tab nur und spielt über die Spotify-App ab.
+
+Danach geplant: Zuschneiden, Ordner und Stichwörter im Kern, Wiedergabe-Steuerung über die Spotify Web API, die Stimme als Kern-Modul über das separat installierte [Voicebox](https://github.com/jamiepine/voicebox), Nutzerkonten (Anmeldung, Profil auf jedem PC gleich), ein Downloader, m4a und ein Assistent, den man nicht erneut durchklicken muss.
 
 Tests sind eigenständige Skripte und laufen mit einem temporären Datenordner, nie gegen die echten Nutzerdaten. Die komplette Testschleife ist jedes `tests\test_*.py` außer `*_manual.py` (die brauchen echte Audio-Hardware) plus `venv\Scripts\python.exe run.py --selftest`; einzeln z. B.:
 
 ```powershell
 venv\Scripts\python.exe tests\test_core_logic.py
 ```
+
+Die manuellen Tests stehen unter `tests\*_manual.py`. Die **Ansichtsmodus-Sperre** („Verwaltung nur im Fenster") muss nicht mehr von Hand geklickt werden: `tests\test_view_mode_manual.py` startet Kern und Server gegen die gebaute Oberfläche und vergleicht beide Rollen (Ansichtslink und Fensterlink) im Browser — die Serverhälfte läuft mit der Schleife.
 
 ## Installer bauen
 

@@ -42,6 +42,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "outputs": {},  # {recording device name (or MONITOR_KEY): DEFAULT_OUTPUT}
     "default_mic": True,  # what a newly appearing cable starts with
     "default_mic_gain": 1.0,
+    "discord_output": None,  # output row key Discord records from; None = the primary cable
     "autostart": False,
     "monitor_device": "default",
     "stop_all_hotkey": "ctrl+ß",  # Strg+ß: types nothing, no AltGr (spec C9, user 2026-09-26)
@@ -49,6 +50,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "sounds_offset_db": -6.0,  # sounds sit this far below the voice on every cable
     "ducking_enabled": True,  # lower the sounds on the cables while the user speaks
     "ducking_db": -6.0,
+    # Spotify's public client id (PKCE, no secret). Empty = the music tab shows a hint.
+    "spotify_client_id": "",
+    # The local server's port. The Spotify redirect callback is the server's own route
+    # (127.0.0.1:47800/callback), so a user-changed port must round-trip through here -
+    # the dashboard knows exactly one URL, and `spotify._callback_url` checks the port.
+    "server_port": 47800,
+    # Musik-Bus (WASAPI-Loopback dessen, was andere Apps spielen; Spec
+    # "musik-bus-kern"): aus beim Start, der Pegel begrenzt auf 0.0-2.0.
+    "musicbus_enabled": False,
+    "musicbus_gain": 1.0,
     "sounds": [],
 }
 

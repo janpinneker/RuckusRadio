@@ -4,11 +4,12 @@ Autostart, Hinweis auf eine beim Laden zurueckgesetzte Config."""
 from __future__ import annotations
 
 from . import autostart as autostart_module
-from .protocol import CompleteOnboarding, SetAutostart
+from .protocol import CompleteOnboarding, RegenerateViewToken, SetAutostart
 
 AUTOSTART_FAILED = "Autostart konnte nicht geändert werden."
 CONFIG_RESET = ("Einstellungen waren beschädigt und wurden zurückgesetzt. "
                 "Sicherung: config.json.bak")
+VIEW_TOKEN_RENEWED = "Der Localhost-Link ist neu. Der alte Link funktioniert nicht mehr."
 
 
 class AppSettingsService:
@@ -17,6 +18,7 @@ class AppSettingsService:
         self._autostart = autostart
         core.handle(CompleteOnboarding, self.complete_onboarding)
         core.handle(SetAutostart, self.set_autostart)
+        core.handle(RegenerateViewToken, self.regenerate_view_token)
         core.add_state("settings", self.snapshot)
         core.on_start(self._report_reset)
 
@@ -49,4 +51,9 @@ class AppSettingsService:
             return
         self._cfg()["autostart"] = bool(cmd.enabled)
         self._core.store.save_now()
+        self._core.state_changed()
+
+    def regenerate_view_token(self, _cmd: RegenerateViewToken) -> None:
+        self._core.access.rotate_view_token()
+        self._core.notice(VIEW_TOKEN_RENEWED)
         self._core.state_changed()

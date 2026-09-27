@@ -225,6 +225,108 @@ def render_report(tk: dict, web: dict, exe: dict, when: str) -> str:
     return "\n".join(lines)
 
 
+# ---- growth probe (spec §5, §11) ----
+# The B0 value (503.7 MB) was a cold start summed over the whole process tree, where
+# shared pages are counted once per process. This probe measures the WARM profile, per
+# process, and above all whether the number MOVES. A flat curve is the goal; the
+# absolute value is not.
+
+GROWTH_LIMIT_MB_PER_1000 = 60.0  # additional MB per 1000 sounds
+IDLE_LIMIT_MB = 40.0             # growth during 30 minutes of idling
+RELOAD_TOLERANCE_MB = 60.0       # how far above the baseline a reload may land
+GROWTH_ENV = "RUCKUS_MEASURE_GROWTH_SOUNDS"
+
+
+def growth_counts() -> list[int]:
+    raw = os.environ.get(GROWTH_ENV, "500,2000")
+    counts = [int(part.strip()) for part in raw.split(",") if part.strip().isdigit()]
+    return counts or [500, 2000]
+
+
+UI_PROCESS = "msedgewebview2.exe"
+APP_PROCESS = "RuckusRadio.exe"
+
+
+def _ui_mb(reading: dict) -> float:
+    """What the interface costs. The limits judge only this: the app process grows with
+    the decoded audio cache on purpose (every sound up to LAZY_DECODE_BYTES is decoded at
+    start), which is reported, not judged (Jan, 2026-09-27). A reading without the
+    per-name split counts as interface as a whole."""
+    if "by_name" not in reading:
+        return reading["ram_mb"]
+    return sum(p["mb"] for p in reading["by_name"] if p["name"] == UI_PROCESS)
+
+
+def _app_mb(reading: dict) -> float | None:
+    if "by_name" not in reading:
+        return None
+    return sum(p["mb"] for p in reading["by_name"] if p["name"] == APP_PROCESS)
+
+
+def growth_report(readings: list[dict]) -> str:
+    """Judge the interface curve: flat while the library grows, flat while idle, and back
+    on the baseline after a reload. The app process is listed with its cost per sound.
+    The verdict names every reason it failed."""
+    baseline = next((r for r in readings if r["sounds"] == 0), None)
+    if baseline is None:
+        return ("# Wachstumsmessung Oberfläche\n\nKeine Grundlinie (0 Sounds) gemessen, "
+                "das Urteil braucht sie.")
+    base_ui = _ui_mb(baseline)
+    failures: list[str] = []
+
+    for r in readings:
+        if r.get("settled") is False:
+            failures.append(f"Messung ungültig: {r['phase']} bei {r['sounds']} Sounds wurde "
+                            "gemessen, während das Vorladen noch lief")
+
+    loaded = [r for r in readings if r["phase"] == "load" and r["sounds"] > 0]
+    for r in loaded:
+        allowed = base_ui + GROWTH_LIMIT_MB_PER_1000 * (r["sounds"] / 1000.0)
+        if _ui_mb(r) > allowed:
+            failures.append(f"Bibliothek (Oberfläche): {r['sounds']} Sounds brauchen "
+                            f"{_ui_mb(r):.1f} MB, erlaubt sind {allowed:.1f} MB "
+                            f"(Grundlinie {base_ui:.1f} MB)")
+
+    idle = [r for r in readings if r["phase"] == "idle"]
+    if idle:
+        last = idle[-1]
+        if last.get("alive") is False or last["ram_mb"] <= 0:
+            failures.append(f"Leerlauf: die App wurde nach {last.get('died_after_s', '?')} s "
+                            "beendet, ohne dass die Probe sie gestoppt hat")
+        else:
+            # A leak anywhere counts here, so the whole tree against the last load reading.
+            last_load = max((r["ram_mb"] for r in loaded), default=baseline["ram_mb"])
+            if last["ram_mb"] - last_load > IDLE_LIMIT_MB:
+                failures.append(f"Leerlauf: +{last['ram_mb'] - last_load:.1f} MB in 30 Minuten, "
+                                f"erlaubt sind {IDLE_LIMIT_MB:.0f} MB")
+
+    reloads = [r for r in readings if r["phase"] == "reload"]
+    if reloads and _ui_mb(reloads[-1]) - base_ui > RELOAD_TOLERANCE_MB:
+        failures.append(f"Neuladen: die Oberfläche landet bei {_ui_mb(reloads[-1]):.1f} MB statt "
+                        f"auf der Grundlinie {base_ui:.1f} MB (erlaubt +{RELOAD_TOLERANCE_MB:.0f} MB)")
+
+    lines = ["# Wachstumsmessung Oberfläche", "",
+             "| Phase | Sounds | Oberfläche (MiB) | App-Prozess (MiB) | Gesamt (MiB) |",
+             "|---|---|---|---|---|"]
+    for r in readings:
+        app = _app_mb(r)
+        app_cell = "–" if app is None else f"{app:.1f}"
+        lines.append(f"| {r['phase']} | {r['sounds']} | {_ui_mb(r):.1f} | {app_cell} "
+                     f"| {r['ram_mb']:.1f} |")
+    lines += ["", f"Grundlinie Oberfläche: {base_ui:.1f} MiB", ""]
+    base_app = _app_mb(baseline)
+    biggest = max(loaded, key=lambda r: r["sounds"], default=None)
+    if base_app is not None and biggest is not None and _app_mb(biggest) is not None:
+        per_sound = (_app_mb(biggest) - base_app) / biggest["sounds"]
+        lines += [f"App-Prozess (nur berichtet, entpackter Audio-Cache): {per_sound:.2f} MB je "
+                  f"Sound bei {biggest['sounds']} Sounds.", ""]
+    if failures:
+        lines += ["**Nicht bestanden.**"] + [f"- {f}" for f in failures]
+    else:
+        lines += ["**Bestanden.** Die Kurve flacht ab, das Neuladen kehrt zur Grundlinie zurück."]
+    return "\n".join(lines)
+
+
 # ---- running inside the app ----
 
 def _sound_info() -> dict:
@@ -353,7 +455,7 @@ def attach_web(window, bridge, core) -> None:
     if not enabled():
         return
 
-    def on_ready(_info: dict) -> None:
+    def on_ready(_client_id: str, _info: dict) -> None:
         mark_ready("web")
         threading.Thread(target=_run_web, args=(window, core), name="measure-web", daemon=True).start()
 

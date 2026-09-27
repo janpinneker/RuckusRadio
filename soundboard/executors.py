@@ -9,6 +9,9 @@ Betrieb nacheinander liefe - Dienste setzen ihren Zustand deshalb, bevor sie Arb
 weitergeben.
 WorkerPool - Daemon-Threads fuer Datei-, ffmpeg- und Rechenarbeit (nie PortAudio).
 Daemon, damit ein haengendes ffmpeg das Beenden der App nicht aufhaelt.
+CancellablePool - eigener Ausgang fuer Netzaufrufe (Voicebox, Spotify, Updates) mit
+kooperativem Abbruch. Getrennt vom WorkerPool, weil eine Anfrage von 300 s keine
+Sound-Dekodierung aufhalten darf und umgekehrt. Siehe die Klasse unten.
 
 Fehlerhuelle: eine Ausnahme in einer Aufgabe geht an on_error, der Thread lebt weiter.
 """
@@ -26,6 +29,9 @@ from typing import Any, Callable
 log = logging.getLogger(__name__)
 
 ErrorHandler = Callable[[Exception], None]
+
+# Wakes an idle net thread without running anything (see CancellablePool.cancel_all).
+WAKE = object()
 
 
 def _log_error(exc: Exception) -> None:
@@ -204,3 +210,82 @@ class WorkerPool:
         for thread in self._threads:
             thread.join(max(0.0, end - time.monotonic()))
         return not any(t.is_alive() for t in self._threads)
+
+
+class CancellablePool:
+    """A separate pool for outbound calls (Voicebox generation, Spotify, updates).
+
+    Why separate: the worker pool has two threads and shares them with ffmpeg. A call
+    that may take 300 seconds must not stand in front of a sound decode, and a sound
+    decode must not delay a call.
+
+    Cancellation is cooperative and never waits: `cancel_all()` sets a flag that the
+    job sees through `cancelled()`, wakes the idle threads, and returns at once. A job
+    wedged inside a blocking socket call cannot be interrupted from here; its caller
+    passes a socket timeout, and the job checks `cancelled()` between steps. This is the
+    Abbruchvertrag: `shutdown` waits for the pool only its share of the budget, and then
+    a stuck call does not hold the app open.
+
+    The flag is cleared by the next `submit`: a cancel is aimed at what runs now, and
+    without the reset every later call would be dropped as if it were cancelled too.
+    Consequence to know: a job queued while `cancel_all` ran is dropped, and a job
+    submitted in the same instant loses the cancel of a still running job.
+    """
+
+    def __init__(self, workers: int = 2, on_error: ErrorHandler = _log_error):
+        self._on_error = on_error
+        self._jobs: queue.Queue = queue.Queue()
+        self._cancel = threading.Event()
+        self._stopping = False
+        self._threads = [threading.Thread(target=self._run, name=f"ruckus-net-{i}", daemon=True)
+                         for i in range(max(1, workers))]
+        for thread in self._threads:
+            thread.start()
+
+    def cancelled(self) -> bool:
+        """True once cancel_all() ran. A long job checks this between steps."""
+        return self._cancel.is_set()
+
+    def submit(self, fn: Callable, *args: Any) -> None:
+        if self._stopping:
+            log.debug("net pool: ignoring work submitted after stop")
+            return
+        if self._cancel.is_set():
+            self._cancel.clear()  # a cancelled run ends here; the next job starts fresh
+        self._jobs.put((fn, args))
+
+    def cancel_all(self) -> None:
+        """Sets the flag, wakes the idle threads, returns at once."""
+        self._cancel.set()
+        for _ in self._threads:
+            self._jobs.put(WAKE)
+
+    @property
+    def alive(self) -> bool:
+        return not self._stopping
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        """Drop what is queued, ask the running jobs to give up, wait at most `timeout`.
+        False means a call was still stuck; they are daemons, so that cannot block exit."""
+        self._stopping = True
+        self.cancel_all()
+        for _ in self._threads:
+            self._jobs.put(None)
+        deadline = time.monotonic() + timeout
+        for thread in self._threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return all(not thread.is_alive() for thread in self._threads)
+
+    def _run(self) -> None:
+        while True:
+            item = self._jobs.get()
+            if item is None:
+                if self._stopping:
+                    return
+                continue
+            if item is WAKE:
+                continue
+            fn, args = item
+            if self._cancel.is_set():
+                continue  # a cancelled run: queued work is dropped, the running job saw the flag
+            _run_guarded(fn, args, self._on_error)

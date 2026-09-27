@@ -13,7 +13,9 @@ Until `onboarding_completed` is set, the first-run assistant opens instead of th
 board (audio + hotkeys are already live so its sound/hotkey steps work); closing
 it early shows the board and it returns on the next start.
 
-`--webui` opens the pywebview window of soundboard.webmain instead of Tk (probe build B0)."""
+The web interface is the default: a pywebview window shows the local server
+(soundboard.webmain). `--tk` keeps the old Tk interface, `--serve` runs the local
+server without any window, and `--webui` stays a synonym for the default."""
 
 from __future__ import annotations
 
@@ -53,10 +55,7 @@ def configure_logging(data_dir: Path) -> RotatingFileHandler:
 
 ALREADY_RUNNING = "Ruckus Radio läuft schon – schau in der Taskleiste nach."
 
-WEBUI_FAILED = """Die Web-Oberfläche konnte nicht starten:
-{}
-
-Starte Ruckus Radio ohne --webui."""
+WEBUI_FAILED = "Die Web-Oberfläche konnte nicht starten. Ruckus Radio läuft ohne --webui weiter."
 
 
 def _show_error(text: str) -> None:
@@ -67,19 +66,41 @@ def _show_error(text: str) -> None:
 
 
 def run_webui(runner=None, show=None) -> bool:
-    """`--webui` (probe build B0). A missing webui/dist, pythonnet or WebView2 - or any
-    other failure - is logged and shown; the windowed exe never ends silently."""
-    try:
-        if runner is None:
-            from soundboard import webmain
+    """Start the web interface. A missing webui/dist, pythonnet or WebView2 - or any
+    other failure - is logged and shown; the windowed exe never ends silently. Returns
+    False so the caller can fall back to Tk."""
+    if runner is None:
+        from soundboard import webmain
 
-            runner = lambda: webmain.run(on_window=measure.attach_web)  # noqa: E731
+        runner = lambda: webmain.run(on_window=measure.attach_web)  # noqa: E731
+    try:
         runner()
         return True
-    except Exception as exc:  # noqa: BLE001 - every start failure must reach the user
-        log.exception("web interface failed to start")
-        (show or _show_error)(WEBUI_FAILED.format(exc))
+    except Exception:  # noqa: BLE001 - every start failure looks the same to the user
+        log.exception("the web interface did not start")
+        (show or _show_error)(WEBUI_FAILED)
         return False
+
+
+def startup_notices(argv: list[str], version: str) -> list[str]:
+    """After a silent in-app update the installer relaunches us with --updated: say so
+    once, with what is new in this version."""
+    if "--updated" not in argv:
+        return []
+    from soundboard.updates import update_notice
+
+    return [update_notice(version)]
+
+
+def parse_mode(argv: list[str]) -> str:
+    """`web` is the default; `--tk` keeps the old interface, `--serve` runs the local
+    server without a window. `--webui` stays a synonym for the default so the existing
+    shortcut keeps working."""
+    if "--tk" in argv:
+        return "tk"
+    if "--serve" in argv:
+        return "serve"
+    return "web"
 
 
 def build_app(core=None, with_hotkeys: bool = True) -> RuckusRadioApp:
@@ -185,10 +206,20 @@ def main() -> None:
         root.destroy()
         return
     try:
-        if "--webui" in sys.argv[1:]:
-            log.info("Ruckus Radio starting (web interface)")
-            run_webui()
-            return
+        mode = parse_mode(sys.argv[1:])
+        if mode in ("web", "serve"):
+            log.info("Ruckus Radio starting (web interface, %s)", mode)
+            from soundboard import webmain
+            from soundboard.version import __version__
+            notices = startup_notices(sys.argv[1:], __version__)
+            runner = lambda: webmain.run(on_window=measure.attach_web, serve_only=(mode == "serve"),  # noqa: E731
+                                         startup_notices=notices)
+            if run_webui(runner=runner, show=print):
+                return
+            if mode == "serve":
+                log.error("der lokale Server konnte nicht starten")
+                return
+            log.error("Web-Oberfläche konnte nicht starten, Rückfall auf Tk")
         log.info("Ruckus Radio starting")
         app = build_app()
         measure.attach_tk(app)  # no-op unless RUCKUS_MEASURE_DIR is set (probe build B0)

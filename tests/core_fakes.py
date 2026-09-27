@@ -86,6 +86,7 @@ class FakeSink:
         self.mic_muted = False
         self.applied: list[tuple[str, dict]] = []
         self.levels: list[tuple[float, bool, float]] = []
+        self.music: list = []  # blocks the music bus pushed through the hook
         self.stopped = False
 
     def set_mic_muted(self, muted):
@@ -96,6 +97,9 @@ class FakeSink:
 
     def apply_levels(self, offset_db, ducking_enabled, ducking_db):
         self.levels.append((offset_db, ducking_enabled, ducking_db))
+
+    def distribute_music(self, block):
+        self.music.append(block)
 
     def stop(self):
         self.stopped = True
@@ -254,6 +258,110 @@ class FakeReleaseSource:
                 on_progress(min(start + half, len(data)), len(data))
 
 
+class FakeSpotifyApi:
+    """Stands in for SpotifyApi: no network. `fail` raises on any call."""
+
+    def __init__(self, user=None, search=None, tracks=None, playlists=None, fail=None,
+                 has_more=False, playlist_items=None):
+        self.user = user if user is not None else {
+            "display_name": "Jan", "images": [{"url": "https://i.scdn.co/u"}]}
+        self.search_items = list(search or [])
+        self.tracks = list(tracks or [])
+        self.playlists = list(playlists or [])
+        # what one page of /playlists/{id}/items carries; default: the saved tracks
+        self.playlist_items = list(playlist_items if playlist_items is not None else (tracks or []))
+        self.has_more = has_more
+        self.fail = fail
+        self.calls: list[tuple] = []
+        self.logins: list[tuple] = []
+
+    def begin_login(self, verifier, state, redirect=""):
+        self.logins.append((verifier, state, redirect))
+
+    def exchange_code(self, code):
+        self.calls.append(("exchange_code", code))
+        if self.fail is not None:
+            raise self.fail
+        return {"refresh_token": "r1", "access_token": "a1", "expires_in": 3600, "scope": "x"}
+
+    @property
+    def is_connected(self):
+        return True
+
+    def get_user(self):
+        self.calls.append(("get_user",))
+        if self.fail is not None:
+            raise self.fail
+        return self.user
+
+    def get(self, path, params=None):
+        self.calls.append(("get", path, dict(params or {})))
+        if self.fail is not None:
+            raise self.fail
+        if path == "/search":
+            return {"tracks": {"items": self.search_items,
+                               "next": "x" if self.has_more else None}}
+        if path == "/me/tracks":
+            return {"items": [{"track": t} for t in self.tracks], "next": None}
+        if path == "/me/playlists":
+            return {"items": self.playlists, "next": None}
+        if path == "/me/albums":
+            return {"items": [], "next": None}
+        if path.startswith("/playlists/"):
+            if path.endswith("/items"):
+                # February 2026: the payload sits under `item`, not `track`
+                return {"items": [{"item": t} for t in self.playlist_items],
+                        "next": "x" if self.has_more else None,
+                        "total": len(self.playlist_items)}
+            return {"id": path.split("/")[2], "name": "Fokus"}
+        return {}
+
+
+class FakeMusicBus:
+    """Stands in for musicbus.MusicBus: never touches WASAPI in the green run."""
+
+    def __init__(self, gain=1.0, **_kwargs):
+        self._gain = float(gain)
+        self.started = 0
+        self.stopped = 0
+        self.closed = 0
+        self.running_flag = False
+        self.error = None
+        self.on_block = None
+        self.on_error = None
+
+    @property
+    def running(self):
+        return self.running_flag
+
+    @property
+    def gain(self):
+        return self._gain
+
+    def set_gain(self, gain):
+        self._gain = float(gain)
+
+    def start(self):
+        self.started += 1
+        self.error = None
+        self.running_flag = True
+
+    def stop(self):
+        self.stopped += 1
+        self.running_flag = False
+
+    def close(self):
+        self.closed += 1
+        self.running_flag = False
+
+    def fail(self, exc):
+        """Test helper: exactly what the real bus thread does on a runtime error."""
+        self.error = exc
+        self.running_flag = False
+        if self.on_error is not None:
+            self.on_error(exc)
+
+
 class QueuedDevices:
     """A device thread stand-in whose jobs sit in a queue until the test lets them
     run, so a command sent while a device job is still queued lands ahead of it -
@@ -309,6 +417,8 @@ def make_core(**overrides):
         autostart_module=overrides.get("autostart", FakeAutostart()),
         update_source=overrides.get("updates", FakeReleaseSource()),
         update_dir=overrides.get("update_dir") or _UPDATE_DIR,
+        spotify_api=overrides.get("spotify_api"),
+        musicbus_factory=overrides.get("musicbus_factory", FakeMusicBus),
     )
     events: list = []
     c.subscribe(events.append)

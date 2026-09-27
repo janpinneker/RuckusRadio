@@ -50,6 +50,10 @@ german.GuidePageDesc=Diese Schritte danach einmalig von Hand erledigen
 german.LaunchVoiceMeeter=VoiceMeeter starten
 german.LaunchApp=Ruckus Radio starten
 german.CreateDesktopIcon=Desktop-Verknüpfung erstellen
+german.ClassicName=Ruckus Radio (klassisch)
+german.WVPageCaption=Anzeige-Laufzeit
+german.WVPageDesc=Microsoft Edge WebView2 — damit zeigt Ruckus Radio seine Oberfläche
+german.WVCheckbox=WebView2 jetzt herunterladen (offizieller Microsoft-Installer, öffnet den Browser)
 english.VMPageCaption=Virtual microphone
 english.VMPageDesc=VB-CABLE or VoiceMeeter - Ruckus Radio needs one of them
 english.VMCheckbox=Download and install VB-CABLE now (opens vb-audio.com in your browser)
@@ -58,6 +62,10 @@ english.GuidePageDesc=Do these steps by hand once, afterwards
 english.LaunchVoiceMeeter=Start VoiceMeeter
 english.LaunchApp=Start Ruckus Radio
 english.CreateDesktopIcon=Create a desktop icon
+english.ClassicName=Ruckus Radio (classic)
+english.WVPageCaption=Display runtime
+english.WVPageDesc=Microsoft Edge WebView2 - Ruckus Radio shows its interface with it
+english.WVCheckbox=Download WebView2 now (official Microsoft installer, opens your browser)
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -70,12 +78,15 @@ Source: "THIRD-PARTY-LICENSES.md"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
+; since 1.2.0 the web interface is the default; the old Tk interface stays as a fallback
+Name: "{autoprograms}\{cm:ClassicName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--tk"; IconFilename: "{app}\icon.ico"
 
 [Run]
 Filename: "{code:GetVoiceMeeterExePath}"; Description: "{cm:LaunchVoiceMeeter}"; Flags: postinstall nowait skipifsilent skipifdoesntexist runasoriginaluser; Check: VoiceMeeterExeFound
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchApp}"; Flags: postinstall nowait skipifsilent runasoriginaluser
-; after a silent in-app update (/UPDATE) Ruckus Radio comes back by itself
-Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser; Check: IsUpdateRun
+; after a silent in-app update (/UPDATE) Ruckus Radio comes back by itself and, told by
+; --updated, shows once which version it is now and what is new
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--updated"; Flags: nowait runasoriginaluser; Check: IsUpdateRun
 
 ; Deliberately no [UninstallDelete] entries pointing at %APPDATA%\Soundboard —
 ; the user's config/sounds/icons must survive an uninstall. The default
@@ -87,11 +98,16 @@ var
   VMPage: TWizardPage;
   VMCheckBox: TNewCheckBox;
   GuidePage: TWizardPage;
+  WVPage: TWizardPage;
+  WVCheckBox: TNewCheckBox;
+  WVAlreadyInstalled: Boolean;
   VMAlreadyInstalled: Boolean;
   VMRegSubkeyPath: String;
 
 const
   AppMutexName = 'Local\RuckusRadioSingleInstance';
+  WebView2ClientKey = 'Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
+  WebView2DownloadUrl = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703';
   UpdateWaitMs = 30000;
 
 function IsUpdateRun: Boolean;
@@ -345,12 +361,32 @@ begin
   Result := IsCableInstalled() or IsVoiceMeeterInstalled();
 end;
 
+function WebView2VersionAt(RootKey: Integer; SubKey: String): Boolean;
+var
+  Version: String;
+begin
+  Result := RegQueryStringValue(RootKey, SubKey, 'pv', Version) and
+            (Trim(Version) <> '') and (Trim(Version) <> '0.0.0.0');
+end;
+
+// The web interface needs the Edge WebView2 runtime (Windows 11 always has it, Windows 10
+// nearly always via Edge). Microsoft's documented check: a 'pv' version under the
+// EdgeUpdate client key, per machine (both registry views) or per user. Without it
+// Ruckus Radio still runs, but falls back to the classic interface.
+function IsWebView2Installed(): Boolean;
+begin
+  Result := WebView2VersionAt(HKLM, 'SOFTWARE\WOW6432Node\' + WebView2ClientKey) or
+            WebView2VersionAt(HKLM, 'SOFTWARE\' + WebView2ClientKey) or
+            WebView2VersionAt(HKCU, 'Software\' + WebView2ClientKey);
+end;
+
 procedure InitializeWizard;
 var
   Lbl: TNewStaticText;
   Memo: TNewMemo;
 begin
   VMAlreadyInstalled := IsVirtualMicInstalled();
+  WVAlreadyInstalled := IsWebView2Installed();
 
   { Both custom pages are inserted right after the "Installing" page, i.e.
     they appear after the app files are copied and before the Finished page
@@ -383,7 +419,31 @@ begin
   VMCheckBox.Caption := CustomMessage('VMCheckbox');
   VMCheckBox.Checked := True;
 
-  GuidePage := CreateCustomPage(VMPage.ID, CustomMessage('GuidePageCaption'), CustomMessage('GuidePageDesc'));
+  WVPage := CreateCustomPage(VMPage.ID, CustomMessage('WVPageCaption'), CustomMessage('WVPageDesc'));
+
+  Lbl := TNewStaticText.Create(WVPage);
+  Lbl.Parent := WVPage.Surface;
+  Lbl.Left := 0;
+  Lbl.Top := 0;
+  Lbl.Width := WVPage.SurfaceWidth;
+  Lbl.AutoSize := False;
+  Lbl.WordWrap := True;
+  Lbl.Height := ScaleY(110);
+  Lbl.Caption :=
+    'Ruckus Radio zeigt seine Oberfläche mit Microsoft Edge WebView2. Auf diesem PC wurde es nicht gefunden.' + #13#10#13#10 +
+    'Ohne WebView2 startet Ruckus Radio mit der klassischen Oberfläche — alles funktioniert, nur sieht es anders aus.' + #13#10#13#10 +
+    'Der Haken unten lädt den offiziellen, kleinen Microsoft-Installer im Browser herunter. ' +
+    'Ihn ausführen, danach Ruckus Radio neu starten. Kein Neustart des PCs nötig.';
+
+  WVCheckBox := TNewCheckBox.Create(WVPage);
+  WVCheckBox.Parent := WVPage.Surface;
+  WVCheckBox.Left := 0;
+  WVCheckBox.Top := Lbl.Top + Lbl.Height + ScaleY(12);
+  WVCheckBox.Width := WVPage.SurfaceWidth;
+  WVCheckBox.Caption := CustomMessage('WVCheckbox');
+  WVCheckBox.Checked := True;
+
+  GuidePage := CreateCustomPage(WVPage.ID, CustomMessage('GuidePageCaption'), CustomMessage('GuidePageDesc'));
   Memo := TNewMemo.Create(GuidePage);
   Memo.Parent := GuidePage.Surface;
   Memo.Left := 0;
@@ -396,14 +456,16 @@ begin
   Memo.Text :=
     'MIT VB-CABLE (empfohlen, Ruckus Radio mischt selbst):' + #13#10#13#10 +
     '1. VB-CABLE von vb-audio.com/Cable installieren, PC neu starten.' + #13#10#13#10 +
-    '2. Ruckus Radio starten. Unten links muss "VB-CABLE verbunden" stehen.' + #13#10#13#10 +
-    '3. Unten rechts "Discord-Gerät" klicken — der exakte Gerätename liegt dann in der Zwischenablage.' + #13#10#13#10 +
-    '4. Discord → Einstellungen → Sprache & Video: Eingabegerät = CABLE Output (VB-Audio Virtual Cable).' + #13#10 +
+    '2. Ruckus Radio starten. Der Punkt am Knopf "Einstellungen" unten links leuchtet grün, sobald VB-CABLE verbunden ist.' + #13#10#13#10 +
+    '3. Discord → Einstellungen → Sprache & Video: Eingabegerät = CABLE Output (VB-Audio Virtual Cable).' + #13#10 +
     '    Steam → Einstellungen → Sprache: dasselbe Gerät.' + #13#10#13#10 +
-    '5. Discord: Rauschunterdrückung und Echounterdrückung AUS — sonst filtert Discord die Sounds weg.' + #13#10#13#10 +
-    '6. Unten rechts "Prüfen" klicken: Ruckus Radio schickt einen Ton durch das Kabel und misst, ob er ankommt.' + #13#10#13#10 +
-    '7. Wichtig: Discord hört dein Mikrofon nur, solange Ruckus Radio läuft. Im Assistenten gibt es dafür ' +
-    '"Mit Windows starten".' + #13#10#13#10#13#10 +
+    '4. Discord: Rauschunterdrückung und Echounterdrückung AUS — sonst filtert Discord die Sounds weg.' + #13#10#13#10 +
+    '5. Mehrere Kabel installiert? In Ruckus Radio unter Einstellungen → Verbindung bei "Discord hört über" ' +
+    'dasselbe Kabel wählen wie in Discord.' + #13#10#13#10 +
+    '6. Einstellungen → Verbindung → "Prüfen": Ruckus Radio schickt einen Ton durch das Kabel und misst, ob er ankommt.' + #13#10#13#10 +
+    '7. Wichtig: Discord hört dein Mikrofon nur, solange Ruckus Radio läuft. Dafür gibt es unter ' +
+    'Einstellungen → Verbindung "Mit Windows starten".' + #13#10#13#10 +
+    '8. Die gewohnte Oberfläche gibt es weiter: Startmenü → "Ruckus Radio (klassisch)".' + #13#10#13#10#13#10 +
     'ODER MIT VOICEMEETER (VoiceMeeter mischt):' + #13#10#13#10 +
     '1. VoiceMeeter installieren, PC neu starten.' + #13#10#13#10 +
     '2. Hardware Input 1 → echtes Mikrofon auswählen, Fader auf 0 dB, nicht gemutet.' + #13#10#13#10 +
@@ -411,7 +473,7 @@ begin
     '4. Hardware Input 1 UND Virtual Input beide auf BUS B routen (Klick auf die "B"-Kachel bei beiden Kanälen).' + #13#10#13#10 +
     '5. Audio-Engine auf 48000 Hz stellen (Ruckus Radio nutzt denselben Sample-Rate).' + #13#10#13#10 +
     '6. Discord und Steam: Eingabegerät = Voicemeeter Out B1. Nicht "Standard", nicht B2/B3 — die füttert nur ' +
-    'die Potato-Edition. Der Knopf "Discord-Gerät" im Dock nennt den richtigen Namen.' + #13#10#13#10 +
+    'die Potato-Edition.' + #13#10#13#10 +
     '7. VoiceMeeter muss laufen, bevor Ruckus Radio gestartet wird — die App sucht das Gerät beim Start.';
 end;
 
@@ -424,12 +486,14 @@ begin
     an unattended /VERYSILENT or /SILENT run. }
   if WizardSilent then
   begin
-    if (PageID = VMPage.ID) or (PageID = GuidePage.ID) then
+    if (PageID = VMPage.ID) or (PageID = WVPage.ID) or (PageID = GuidePage.ID) then
       Result := True;
     Exit;
   end;
 
   if (PageID = VMPage.ID) and VMAlreadyInstalled then
+    Result := True;
+  if (PageID = WVPage.ID) and WVAlreadyInstalled then
     Result := True;
 end;
 
@@ -442,4 +506,6 @@ begin
     Exit;
   if (CurPageID = VMPage.ID) and (not VMAlreadyInstalled) and VMCheckBox.Checked then
     ShellExec('open', 'https://vb-audio.com/Cable/', '', '', SW_SHOWNORMAL, ewNoWait, ErrorCode);
+  if (CurPageID = WVPage.ID) and (not WVAlreadyInstalled) and WVCheckBox.Checked then
+    ShellExec('open', WebView2DownloadUrl, '', '', SW_SHOWNORMAL, ewNoWait, ErrorCode);
 end;

@@ -2,7 +2,10 @@
 
 Hier steht bewusst KEINE Fachlogik. Fachmodule registrieren sich selbst:
   core.handle(Befehlsklasse, fn)  - fn(befehl) laeuft auf dem Kern-Thread
-  core.add_state(name, fn)        - fn() liefert ihren Teil der Momentaufnahme
+  core.add_state(name, fn, group="volatile") - fn() liefert ihren Teil der Momentaufnahme;
+                                    group trennt klein/hauefig (volatile) von gross/selten
+                                    (z.B. library), damit die Last pro Sekunde nicht mit
+                                    der Bibliothek waechst. core.changed(group) meldet sie.
   core.on_start(fn), core.on_shutdown(fn) - Lebenszyklus, auf dem Kern-Thread
   core.before_shutdown(fn)        - laeuft sofort im Thread, der shutdown() ruft
 Registrierung (handle, add_state, on_*, before_shutdown) muss abgeschlossen sein, bevor
@@ -22,13 +25,16 @@ import threading
 import time
 from typing import Any, Callable
 
-from .executors import InlineExecutor, SerialExecutor, WorkerPool
-from .protocol import PROTOCOL_VERSION, Notice, StateChanged
+from .executors import CancellablePool, InlineExecutor, SerialExecutor, WorkerPool
+from .protocol import PartChanged, PROTOCOL_VERSION, Notice, StateChanged
 from .store import Store
 
 log = logging.getLogger(__name__)
 
 STATE_INTERVAL_S = 1 / 30  # StateChanged at most ~30 times per second
+# Die Gruppe eines Zustandsteils ist ein freies Etikett (Musik und Stimme legen spaeter
+# eigene an), aber kein leerer Name. Der Vorgabewert ist der kleine, haeufige Teil.
+DEFAULT_GROUP = "volatile"
 INTERNAL_ERROR = "Interner Fehler – Details stehen in ruckus.log."
 SAVE_FAILED = ("Einstellungen konnten nicht gespeichert werden. "
                "Die bisherige Datei bleibt erhalten.")
@@ -41,24 +47,30 @@ class Core:
             self.executor = InlineExecutor(self._task_failed)
             self.devices = InlineExecutor(self._task_failed)
             self.workers = InlineExecutor(self._task_failed)
+            self.net = InlineExecutor(self._task_failed)
         else:
             self.executor = SerialExecutor("ruckus-core", self._task_failed)
             from .devices import init_thread_com
             self.devices = SerialExecutor("ruckus-devices", self._task_failed,
                                           on_start=init_thread_com)
             self.workers = WorkerPool(2, self._task_failed)
+            self.net = CancellablePool(2, self._task_failed)
         self.store = Store(self.executor, data=store_data)
         self.store.on_save_failed = lambda _exc: self.notice(SAVE_FAILED, "hint")
         # Set by create_core(); services reach each other through these.
         self.engine = None
         self.playback = None
+        self.jobs = None
         self.hotkeys = None
         self.library = None
         self.routing = None
         self.settings = None
         self.updates = None
+        self.spotify = None
+        self.musicbus = None
         self._handlers: dict[type, Callable[[Any], None]] = {}
         self._state_parts: dict[str, Callable[[], Any]] = {}
+        self._state_groups: dict[str, str] = {}
         self._start_steps: list[Callable[[], None]] = []
         self._shutdown_steps: list[Callable[[], None]] = []
         self._before_shutdown: list[Callable[[], None]] = []
@@ -78,10 +90,15 @@ class Core:
             raise ValueError(f"{command_type.__name__} already has a handler")
         self._handlers[command_type] = fn
 
-    def add_state(self, name: str, fn: Callable[[], Any]) -> None:
+    def add_state(self, name: str, fn: Callable[[], Any], group: str = DEFAULT_GROUP) -> None:
+        """`fn` is a PURE READ of cached data: no network, no disk, no devices. It runs
+        on the core thread and must never block there."""
         if name in self._state_parts or name == "protocol":
             raise ValueError(f"state part {name!r} already exists")
+        if not group:
+            raise ValueError("a state group needs a name")
         self._state_parts[name] = fn
+        self._state_groups[name] = group
 
     def on_start(self, fn: Callable[[], None]) -> None:
         self._start_steps.append(fn)
@@ -150,18 +167,32 @@ class Core:
         self._state_timer = None
         self.emit(StateChanged(self.state()))
 
-    def state(self) -> dict:
-        """Full JSON-safe snapshot; core thread only (use get_state elsewhere). One
-        broken part must not break the whole snapshot: on exception its value is
-        None and the failure is logged."""
+    def state(self, group: str | None = None) -> dict:
+        """Full JSON-safe snapshot; core thread only (use get_state elsewhere). With
+        `group`, only that part is built. One broken part must not break the whole
+        snapshot: on exception its value is None and the failure is logged."""
         snapshot: dict[str, Any] = {"protocol": PROTOCOL_VERSION}
         for name, fn in self._state_parts.items():
+            if group is not None and self._state_groups[name] != group:
+                continue
             try:
                 snapshot[name] = fn()
             except Exception:
                 log.exception("state part %r failed", name)
                 snapshot[name] = None
         return snapshot
+
+    def changed(self, group: str = DEFAULT_GROUP) -> None:
+        """Announce a change in one group. The library group must be announced this way
+        in addition to state_changed(): a page must never learn about a new sound from
+        the volatile part."""
+        if group == DEFAULT_GROUP:
+            self.state_changed()
+            return
+        self.executor.submit(self._emit_part, group)
+
+    def _emit_part(self, group: str) -> None:
+        self.emit(PartChanged(group, self.state(group)))
 
     def get_state(self, timeout: float = 2.0) -> dict:
         if self.executor.is_current():
@@ -239,6 +270,9 @@ class Core:
 
         self._accepting = False
         self._run_steps(list(self._before_shutdown), "before-shutdown")
+        # Ausgehende Aufrufe zuerst abbrechen: sie koennen nicht erzwungen werden, also
+        # soll ihr Restbudget klein sein und den Rest nicht aufhalten.
+        self.net.stop(min(remaining(), timeout / 4))
 
         finished = threading.Event()
 
@@ -278,14 +312,21 @@ class Core:
 
 def create_core(*, inline: bool = False, engine=None, backend=None, hotkey_manager=None,
                 store_data: dict | None = None, autostart_module=None,
-                update_source=None, update_dir=None) -> Core:
+                update_source=None, update_dir=None, spotify_api=None,
+                musicbus_factory=None) -> Core:
     """The assembled core. Service order is start order: playback (preload),
-    hotkeys (register), library (loudness backfill), routing (devices), settings, updates."""
+    hotkeys (register), library (loudness backfill), routing (devices), settings,
+    updates, spotify, musicbus. `musicbus_factory` builds the capture bus (tests
+    pass a fake - never a real WASAPI capture in the green run)."""
+
+    from .access import Access
     from .appsettings import AppSettingsService
     from .hotkeyservice import HotkeyService
     from .library import LibraryService
+    from .musicbus import MusicBusService
     from .playback import PlaybackService
     from .routing import DeviceBackend, RoutingService
+    from .spotify import SpotifyService
     from .updates import UpdateService
 
     core = Core(inline=inline, store_data=store_data)
@@ -294,6 +335,9 @@ def create_core(*, inline: bool = False, engine=None, backend=None, hotkey_manag
         engine = AudioEngine(None, None, sink=None)
     core.engine = engine
     core.playback = PlaybackService(core)
+    from .jobs import JobsService
+    core.jobs = JobsService(core)
+    core.access = Access(core.store)
     core.hotkeys = HotkeyService(core, hotkey_manager)
     core.library = LibraryService(core)
     core.routing = RoutingService(core, backend if backend is not None else DeviceBackend())
@@ -302,4 +346,6 @@ def create_core(*, inline: bool = False, engine=None, backend=None, hotkey_manag
     else:
         core.settings = AppSettingsService(core, autostart_module)
     core.updates = UpdateService(core, update_source, update_dir)
+    core.spotify = SpotifyService(core, api=spotify_api)
+    core.musicbus = MusicBusService(core, factory=musicbus_factory)
     return core

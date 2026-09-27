@@ -266,6 +266,19 @@ def test_stop_all_migration_survives_non_string_hotkeys():
     print("stop-all migration treats non-string hotkeys as no hotkey: OK")
 
 
+def test_music_bus_defaults_and_gain_clamping():
+    """Musik-Bus (Spec \"musik-bus-kern\" §3): aus beim Start, Gain 1.0, 0.0–2.0."""
+    fresh = config._default_config()
+    assert fresh["musicbus_enabled"] is False, "der Bus startet aus"
+    assert fresh["musicbus_gain"] == 1.0
+    merged = config._with_defaults({"version": 2})  # eine Config ohne die neuen Schluessel
+    assert merged["musicbus_enabled"] is False and merged["musicbus_gain"] == 1.0
+    assert config.clamp_gain(-1.0) == 0.0
+    assert config.clamp_gain(9.0) == 2.0
+    assert config.clamp_gain(0.25) == 0.25
+    print("music bus defaults and gain clamping: OK")
+
+
 def main():
     test_fresh_config_has_outputs()
     test_old_config_keeps_working()
@@ -280,6 +293,7 @@ def main():
     test_stop_all_default_is_alt_delete_and_the_old_default_migrates()
     test_stop_all_migration_is_one_time_and_skips_a_taken_alt_delete()
     test_stop_all_migration_survives_non_string_hotkeys()
+    test_music_bus_defaults_and_gain_clamping()
     print("\nALL CONFIG LOGIC CHECKS PASSED")
 
 

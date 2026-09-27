@@ -187,6 +187,55 @@ def test_non_https_asset_url_is_rejected():
     print("a non-https asset url is rejected: OK")
 
 
+def test_launch_installer_starts_detached_with_a_clean_env_and_log():
+    started: list[list[str]] = []
+    kwargs: list[dict] = []
+    original_popen = updates.subprocess.Popen
+
+    def fake_popen(args, **kw):
+        started.append(args)
+        kwargs.append(kw)
+
+    # a fake PyInstaller onefile marker: launch_installer must strip it, not pass it on to
+    # the installer's relaunch of Ruckus (else the bootloader treats itself as a dead
+    # process's child)
+    old_pyi = os.environ.get("_PYI_ARCHIVE_FILE")
+    os.environ["_PYI_ARCHIVE_FILE"] = "C:/fake/RuckusRadio.exe"
+    try:
+        updates.subprocess.Popen = fake_popen
+        assert updates.launch_installer("C:/tmp/RuckusRadioSetup-9.0.0.exe") is True
+        expected_log = Path("C:/tmp/RuckusRadioSetup-9.0.0.exe").with_name("install.log")
+        assert started == [["C:/tmp/RuckusRadioSetup-9.0.0.exe", "/VERYSILENT",
+                            "/SUPPRESSMSGBOXES", "/NORESTART", "/UPDATE",
+                            f"/LOG={expected_log}"]]
+        env = kwargs[0]["env"]
+        assert not [k for k in env if k.startswith("_PYI_")], \
+            "PyInstaller onefile markers must not reach the relaunched exe"
+        assert env["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    finally:
+        updates.subprocess.Popen = original_popen
+        if old_pyi is None:
+            os.environ.pop("_PYI_ARCHIVE_FILE", None)
+        else:
+            os.environ["_PYI_ARCHIVE_FILE"] = old_pyi
+    print("launch_installer starts the installer detached with a clean env and an "
+          "install log: OK")
+
+
+def test_launch_installer_returns_false_on_oserror():
+    original_popen = updates.subprocess.Popen
+
+    def boom(args, **kw):
+        raise OSError("blocked")
+
+    try:
+        updates.subprocess.Popen = boom
+        assert updates.launch_installer("C:/tmp/x.exe") is False
+    finally:
+        updates.subprocess.Popen = original_popen
+    print("launch_installer returns False (and logs) when the OS refuses to start it: OK")
+
+
 def test_github_answer_is_read_correctly():
     release, _files = core_fakes.fake_release(version="2.0.1", notes="Hallo")
     info = updates.release_info(release)
@@ -208,6 +257,8 @@ def main():
     test_unexpected_error_during_check_frees_the_button()
     test_unexpected_error_during_install_leaves_no_part_file()
     test_leftover_installer_from_a_killed_worker_is_swept()
+    test_launch_installer_starts_detached_with_a_clean_env_and_log()
+    test_launch_installer_returns_false_on_oserror()
     test_non_https_asset_url_is_rejected()
     test_github_answer_is_read_correctly()
     print("\nALL UPDATES LOGIC CHECKS PASSED")

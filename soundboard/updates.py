@@ -1,5 +1,6 @@
 """Updates ueber GitHub Releases: pruefen, laden, Pruefsumme. Installieren (Installer
-starten, beenden) macht die Oberflaeche nach UpdateReady.
+starten, beenden) macht die Oberflaeche nach UpdateReady - ueber `launch_installer`,
+das sowohl das Tk-Fenster als auch der Web-Host (webmain.py) aufrufen.
 
 Thread-Regeln wie ueberall im Kern: Netz und Dateien nur auf Worker-Threads, Zustand nur
 auf dem Kern-Thread. Kein automatisches Pruefen - nur auf CheckForUpdates."""
@@ -10,7 +11,9 @@ import hashlib
 import http.client
 import json
 import logging
+import os
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -42,6 +45,53 @@ UPDATE_BROKEN = ("Das Update ist beschädigt angekommen und wurde verworfen. Ver
                  "später noch einmal.")
 UPDATE_INCOMPLETE = ("Auf GitHub fehlt die Installationsdatei für diese Version. Versuch es "
                      "später noch einmal.")
+UPDATE_LAUNCH_FAILED = "Das Update konnte nicht gestartet werden. Installationsdatei: {path}"
+UPDATE_DONE = "Ruckus Radio wurde auf {version} aktualisiert."
+#: Shown once after a silent in-app update to that version (the installer passes --updated).
+WHATS_NEW = {
+    "1.2.0": ("Neu: die Web-Oberfläche ist jetzt Standard. Die gewohnte Oberfläche startest "
+              "du über „Ruckus Radio (klassisch)“ im Startmenü."),
+}
+
+
+def update_notice(version: str) -> str:
+    news = WHATS_NEW.get(version)
+    done = UPDATE_DONE.format(version=version)
+    return f"{done} {news}" if news else done
+DETACHED_FLAGS = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+
+def clean_child_env() -> dict:
+    """Env for the relaunched installer, without PyInstaller's onefile markers.
+
+    Ruckus itself runs as a PyInstaller onefile exe, so its process carries
+    _PYI_ARCHIVE_FILE/_PYI_APPLICATION_HOME_DIR/_PYI_PARENT_PROCESS_LEVEL. Popen
+    inherits the environment by default, and the installer's own [Run] entry
+    relaunches the (also onefile) app exe with that same environment still set -
+    its bootloader then thinks it is a onefile child of this (by then dead)
+    process and shows an "Error" window instead of starting normally.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI_")}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
+def launch_installer(path: str) -> bool:
+    """Start the verified installer detached, with a clean env and an install log next
+    to it. Shared by the Tk window and the web host (webmain.py) - both quit right
+    after this succeeds; the caller decides how. Returns False (and logs) when the OS
+    refuses to start it."""
+    log_path = Path(path).with_name("install.log")
+    # No quotes inside /LOG=: Popen quotes the whole argument when needed, while an inner
+    # quote would reach Inno as \" - it then cannot create the log and aborts the setup.
+    try:
+        subprocess.Popen([path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/UPDATE",
+                          f"/LOG={log_path}"],
+                         close_fds=True, creationflags=DETACHED_FLAGS, env=clean_child_env())
+    except OSError:
+        log.exception("starting the update installer failed")
+        return False
+    return True
 
 
 class UpdateError(Exception):

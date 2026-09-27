@@ -9,20 +9,21 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import queue
-import subprocess
-from pathlib import Path
 from tkinter import filedialog, messagebox
+from typing import TYPE_CHECKING
 
 import customtkinter as ctk
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from soundboard import protocol as p, theme
 from soundboard.layout import signal_check_summary
 from soundboard.library import NOTHING_TO_EXPORT
 from soundboard.packs import sanitize_filename
 from soundboard.routing import NO_VIRTUAL_MIC
-from soundboard.updates import UPDATE_QUESTION
+from soundboard.updates import UPDATE_LAUNCH_FAILED, UPDATE_QUESTION, launch_installer
 from soundboard.widgets import AddSoundDialog, HotkeyCaptureDialog, SoundTile, VolumeDialog
 
 ctk.set_appearance_mode("dark")
@@ -41,23 +42,6 @@ CORE_DEAD = "Ruckus Radio reagiert nicht mehr. Bitte Ruckus neu starten."
 DISCORD_SOUNDS_OFF = "Sounds in Discord aus – dein Mikro bleibt an."
 DISCORD_SOUNDS_ON = "Sounds in Discord wieder an."
 CONFIG_RESET_HINT = "Einstellungen waren beschädigt und wurden zurückgesetzt. Sicherung: config.json.bak"
-UPDATE_LAUNCH_FAILED = "Das Update konnte nicht gestartet werden. Installationsdatei: {path}"
-DETACHED_FLAGS = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-
-
-def clean_child_env() -> dict:
-    """Env for the relaunched installer, without PyInstaller's onefile markers.
-
-    Ruckus itself runs as a PyInstaller onefile exe, so its process carries
-    _PYI_ARCHIVE_FILE/_PYI_APPLICATION_HOME_DIR/_PYI_PARENT_PROCESS_LEVEL. Popen
-    inherits the environment by default, and the installer's own [Run] entry
-    relaunches the (also onefile) app exe with that same environment still set -
-    its bootloader then thinks it is a onefile child of this (by then dead)
-    process and shows an "Error" window instead of starting normally.
-    """
-    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI_")}
-    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-    return env
 
 
 def export_default_name(sounds: list[dict], sound_ids: list[str]) -> str:
@@ -445,15 +429,7 @@ class RuckusRadioApp(ctk.CTk):
     def launch_update(self, path: str) -> None:
         """Start the verified installer detached, then quit through the core - the user
         already said yes, so no microphone question here."""
-        log_path = Path(path).with_name("install.log")
-        # No quotes inside /LOG=: Popen quotes the whole argument when needed, while an inner
-        # quote would reach Inno as \" - it then cannot create the log and aborts the setup.
-        try:
-            subprocess.Popen([path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/UPDATE",
-                              f"/LOG={log_path}"],
-                             close_fds=True, creationflags=DETACHED_FLAGS, env=clean_child_env())
-        except OSError:
-            log.exception("starting the update installer failed")
+        if not launch_installer(path):
             self.show_hint("")
             messagebox.showerror("Ruckus Radio", UPDATE_LAUNCH_FAILED.format(path=path), parent=self)
             return

@@ -97,7 +97,7 @@ if ($cmp -gt 0) {
     (Get-Content $versionFile -Raw) -replace '__version__ = ".+"', "__version__ = `"$Version`"" |
         Set-Content $versionFile -NoNewline -Encoding utf8
     git add soundboard/version.py
-    git commit -q -m "chore: version $Version" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+    git commit -q -m "chore: version $Version"
     if ($LASTEXITCODE -ne 0) { Fail "Versions-Commit fehlgeschlagen" }
 }
 

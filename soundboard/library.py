@@ -15,10 +15,12 @@ from pathlib import Path
 
 from . import config, icons, loudness
 from .audio import extract_audio
+from .filedialogs import FileDialogs
 from .packs import PackError, export_pack
 from .packs import import_pack as read_pack
 from .protocol import (AddSound, DeleteSound, ExportSounds, ImportPack, RenameSound,
-                       SetSoundIcon, SetSoundVolume, SoundAdded)
+                       RequestAddSound, RequestExportSounds, RequestImportPack,
+                       RequestSetSoundIcon, SetSoundIcon, SetSoundVolume, SoundAdded)
 
 log = logging.getLogger(__name__)
 
@@ -73,8 +75,11 @@ def prepare_sound(data_dir: Path, sound_id: str, name: str, audio_path: Path,
 
 
 class LibraryService:
-    def __init__(self, core):
+    def __init__(self, core, dialogs=None):
         self._core = core
+        # Tests setzen eine Attrappe ein; im Betrieb entstehen die nativen Dialoge erst
+        # beim ersten Request (FileDialogs startet seinen Tk-Thread nur bei Bedarf).
+        self._dialogs = dialogs if dialogs is not None else FileDialogs()
         self._loudness_running = False
         self._icon_rev: dict[str, int] = {}  # sound id -> revision, not persisted
         core.handle(AddSound, self.add)
@@ -84,7 +89,11 @@ class LibraryService:
         core.handle(SetSoundVolume, self.set_volume)
         core.handle(ExportSounds, self.export)
         core.handle(ImportPack, self.import_pack)
-        core.add_state("sounds", self._sounds_state)
+        core.handle(RequestAddSound, self._request_add_sound)
+        core.handle(RequestImportPack, self._request_import_pack)
+        core.handle(RequestExportSounds, self._request_export_sounds)
+        core.handle(RequestSetSoundIcon, self._request_set_sound_icon)
+        core.add_state("sounds", self._sounds_state, group="library")
         core.on_start(self.start_loudness_backfill)
 
     def _sounds_state(self) -> list[dict]:
@@ -107,6 +116,7 @@ class LibraryService:
     def _save_and_publish(self) -> None:
         self._core.store.save_now()
         self._core.state_changed()
+        self._core.changed("library")
 
     # ---- add ----
 
@@ -139,6 +149,45 @@ class LibraryService:
             return
         log.error("adding %s failed: %r", audio_path, exc)
         self._core.notice(AUDIO_UNREADABLE.format(name=audio_path.name), "error")
+
+    # ---- requests: the page asks, Python opens the dialog ----
+
+    def _request_add_sound(self, command) -> None:
+        path = self._dialogs.pick_sound_file()
+        if not path:
+            return  # cancelled: nothing changes
+        self.add(AddSound(path, Path(path).stem, None))
+
+    def _request_import_pack(self, command) -> None:
+        path = self._dialogs.pick_pack_file()
+        if not path:
+            return
+        self.import_pack(ImportPack(path))
+
+    def _request_export_sounds(self, command) -> None:
+        if not self.sounds:
+            self._core.notice(NOTHING_TO_EXPORT, "info")
+            return
+        if command.sound_id is not None:
+            sound = self._find(command.sound_id)
+            if sound is None:
+                return
+            chosen, default = (sound["id"],), f"{sound['name']}.ruckuspack"
+        else:
+            chosen = tuple(s["id"] for s in self.sounds)
+            default = "sounds.ruckuspack"
+        target = self._dialogs.ask_export_target(default)
+        if not target:
+            return
+        self.export(ExportSounds(target, chosen))
+
+    def _request_set_sound_icon(self, command) -> None:
+        if self._find(command.sound_id) is None:
+            return
+        path = self._dialogs.pick_icon_file()
+        if not path:
+            return
+        self.set_icon(SetSoundIcon(command.sound_id, path))
 
     # ---- change / delete ----
 
@@ -199,6 +248,7 @@ class LibraryService:
             return
         self._icon_rev[sound_id] = self._icon_rev.get(sound_id, 0) + 1
         self._core.state_changed()
+        self._core.changed("library")  # geht am Engpass _save_and_publish vorbei
 
     # ---- packs ----
 

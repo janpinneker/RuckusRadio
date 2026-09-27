@@ -528,6 +528,56 @@ def test_sound_limiter_catches_overlaps():
     print("two overlapping sounds stay below -1 dBFS: OK")
 
 
+def test_music_reaches_every_sounds_target_and_nobody_steals_the_block():
+    """Musik-Bus (Spec §4): Muster _distribute_mic - eine Queue je Ziel, kein Ziel
+    darf einem anderen Bloecke wegnehmen."""
+    a = fake_target("a", settings(mic=False))
+    b = fake_target("b", settings(mic=False))
+    off = fake_target("off", settings(mic=False, sounds=False))
+    group = sinkgroup.SinkGroup([a, b, off], mic_device=None)
+    group.start()
+    group.distribute_music(tone(0.3))
+    assert np.allclose(pull(a), 0.3) and np.allclose(pull(b), 0.3), \
+        "beide Ziele erhalten denselben Block"
+    assert not pull(off).any(), "sounds aus: keine Musik"
+    group.stop()
+    print("Musik erreicht jedes sounds-Ziel, niemand stiehlt Bloecke: OK")
+
+
+def test_music_runs_through_the_sound_branch():
+    """Musik liegt in chunks, nicht in blocks: Offset und Ducking wirken darauf."""
+    cable = fake_target("CABLE Output", settings(mic=False))
+    group = start_with_mic(sinkgroup.SinkGroup([cable], mic_device=None))
+    group.apply_levels(-6.0, True, -6.0)
+    group.voice.speaking = True
+    for _ in range(60):
+        group.distribute_music(tone(0.4))
+        out = pull(cable)
+    ducked = 0.4 * dynamics.db_to_gain(-6.0) * dynamics.db_to_gain(-6.0)
+    assert np.allclose(out, ducked, atol=1e-3), f"{float(out[0, 0]):.4f} statt {ducked:.4f}"
+    group.voice.speaking = False
+    for _ in range(400):
+        group.distribute_music(tone(0.4))
+        out = pull(cable)
+    assert np.allclose(out, 0.4 * dynamics.db_to_gain(-6.0), atol=1e-3), float(out[0, 0])
+    group.stop()
+    print("Musik laeuft durch den Sound-Zweig (Offset + Ducking): OK")
+
+
+def test_the_monitor_hears_the_music_unregulated():
+    """Kopfhörer: sounds_offset 1.0, kein Ducker - was andere hoeren wird geregelt,
+    das eigene Mithoeren nicht (Spec §4)."""
+    monitor = fake_target(config.MONITOR_KEY, settings(mic=False))
+    group = start_with_mic(sinkgroup.SinkGroup([monitor], mic_device=None))
+    group.apply_levels(-6.0, True, -6.0)
+    group.voice.speaking = True
+    group.distribute_music(tone(0.4))
+    assert np.allclose(pull(monitor), 0.4), "kein Offset, kein Duck"
+    assert monitor.ducker is None and monitor.sounds_offset == 1.0
+    group.stop()
+    print("Kopfhoerer hoert die Musik unreguliert: OK")
+
+
 def test_build_applies_the_configured_levels():
     cfg = config._default_config()
     cfg["sounds_offset_db"] = -10.0
@@ -544,6 +594,35 @@ def test_build_applies_the_configured_levels():
     assert cable.ducker is not None and cable.ducker.enabled is False
     assert monitor.sounds_offset == 1.0 and monitor.ducker is None
     print("build applies the configured levels: OK")
+
+
+def test_a_level_change_reaches_a_sound_that_is_already_playing():
+    """Jan's hand check 2026-09-27: moving the headphone level during a sound changed
+    nothing - the level was baked into the source when it started."""
+    phones = fake_target(config.MONITOR_KEY, settings(mic=False, sounds_gain=1.0))
+    group = sinkgroup.SinkGroup([phones], mic_device=None)
+    group.start()
+    group.add_source(tone(0.4, frames=FRAMES * 4), gain=0.5)
+    assert abs(pull(phones)[0, 0] - 0.2) < 1e-6
+    group.apply(config.MONITOR_KEY, settings(mic=False, sounds_gain=0.25))
+    assert abs(pull(phones)[0, 0] - 0.4 * 0.5 * 0.25) < 1e-6, "the playing sound follows the slider"
+    group.add_source(tone(0.4, frames=FRAMES * 4), gain=0.5)
+    assert abs(pull(phones)[0, 0] - 2 * 0.4 * 0.5 * 0.25) < 1e-6, "a new sound starts at the new level"
+    group.stop()
+    print("a level change reaches a sound that is already playing: OK")
+
+
+def test_switching_sounds_off_silences_a_playing_sound_on_that_target_only():
+    cable = fake_target("cable", settings(mic=False))
+    phones = fake_target(config.MONITOR_KEY, settings(mic=False))
+    group = sinkgroup.SinkGroup([cable, phones], mic_device=None)
+    group.start()
+    group.add_source(tone(0.4, frames=FRAMES * 4), gain=1.0)
+    group.apply("cable", settings(mic=False, sounds=False))
+    assert abs(pull(cable)[0, 0]) < 1e-9, "Discord stops hearing the sound at once"
+    assert abs(pull(phones)[0, 0] - 0.4) < 1e-6, "the headphones keep playing it"
+    group.stop()
+    print("switching sounds off silences a playing sound on that target only: OK")
 
 
 def main():
@@ -573,7 +652,12 @@ def main():
     test_ducking_lowers_sounds_while_speaking()
     test_muted_mic_never_ducks()
     test_sound_limiter_catches_overlaps()
+    test_music_reaches_every_sounds_target_and_nobody_steals_the_block()
+    test_music_runs_through_the_sound_branch()
+    test_the_monitor_hears_the_music_unregulated()
     test_build_applies_the_configured_levels()
+    test_a_level_change_reaches_a_sound_that_is_already_playing()
+    test_switching_sounds_off_silences_a_playing_sound_on_that_target_only()
     print("\nALL SINKGROUP LOGIC CHECKS PASSED")
 
 

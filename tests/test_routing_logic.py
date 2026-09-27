@@ -328,6 +328,68 @@ def test_headphone_volume_follows_the_migrated_gain():
     print("headphone volume follows the migrated Kopfhörer gain: OK")
 
 
+def test_the_music_bus_hook_follows_every_sink_rebuild():
+    """Spec \"musik-bus-kern\" §4/§6.1: der on_block-Haken hängt an der SinkGroup und
+    muss bei JEDEM Neuaufbau (Rescan, Prüfung, Gerätewechsel) erneut gesetzt werden -
+    sonst verstummt die Musik still."""
+    backend = core_fakes.FakeBackend()
+    c, _events = core_fakes.make_core(backend=backend)
+    bus = c.musicbus.bus
+    c.start()
+    assert len(backend.sinks) == 1
+    assert bus.on_block == backend.sinks[0].distribute_music
+    c.send(p.Rescan())
+    assert len(backend.sinks) == 2
+    assert bus.on_block == backend.sinks[1].distribute_music, "der Haken hängt am NEUEN Sink"
+    c.send(p.RunSignalCheck())
+    assert len(backend.sinks) == 3
+    assert bus.on_block == backend.sinks[2].distribute_music, "auch nach der Prüfung wieder"
+    c.shutdown()
+    assert bus.on_block is None, "beim Beenden hängt der Haken ab"
+    print("der Musik-Bus-Haken folgt jedem Sink-Neuaufbau: OK")
+
+
+HIFI = "Hi-Fi Cable Output (VB-Audio Hi-Fi Cable)"
+
+
+def test_the_user_names_the_cable_discord_records_from():
+    """With two cables Ruckus cannot see which one Discord records from: the primary
+    cable was only a guess (Jan's handcheck 2026-09-27: Discord on Hi-Fi Cable, the dock
+    button muted VB-CABLE). SetDiscordOutput names it; "" goes back to the primary."""
+    c, events, backend = setup(start=False)
+    backend.resolved["virtual_mics"].append(
+        {"key": HIFI, "label": "Hi-Fi Cable", "out_index": 31, "in_index": 41,
+         "out_name": "Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)", "in_name": HIFI})
+    c.start()
+    assert c.state()["devices"]["discord_device_name"] == CABLE, "default: the primary cable"
+
+    c.send(p.SetDiscordOutput(HIFI))
+    assert c.state()["devices"]["discord_device_name"] == HIFI
+    assert on_disk()["discord_output"] == HIFI, "the choice is saved at once"
+    changed = core_fakes.of_type(events, p.DevicesChanged)
+    c.send(p.Rescan())
+    assert core_fakes.of_type(events, p.DevicesChanged)[-1].summary["discord_device_name"] == HIFI
+    assert len(core_fakes.of_type(events, p.DevicesChanged)) == len(changed) + 1
+
+    # A cable that is gone (uninstalled, renamed) falls back to the primary one.
+    backend.resolved["virtual_mics"].pop()
+    c.send(p.Rescan())
+    assert c.state()["devices"]["discord_device_name"] == CABLE
+    assert on_disk()["discord_output"] == HIFI, "the choice survives until the cable is back"
+
+    c.send(p.SetDiscordOutput(""))
+    assert on_disk()["discord_output"] is None
+    assert c.state()["devices"]["discord_device_name"] == CABLE
+    print("the user names the cable Discord records from: OK")
+
+
+def test_discord_output_ignores_the_headphones():
+    c, _events, _backend = setup()
+    c.send(p.SetDiscordOutput(config.MONITOR_KEY))
+    assert c.state()["devices"]["discord_device_name"] == CABLE, "headphones are no Discord cable"
+    print("the headphones are never Discord's cable: OK")
+
+
 def main():
     test_start_builds_the_mixer_and_describes_it()
     test_outputs_and_levels_reach_the_mixer()
@@ -345,6 +407,9 @@ def main():
     test_no_rescan_after_shutdown()
     test_assistant_mic_choices_come_from_the_device_thread()
     test_headphone_volume_follows_the_migrated_gain()
+    test_the_music_bus_hook_follows_every_sink_rebuild()
+    test_the_user_names_the_cable_discord_records_from()
+    test_discord_output_ignores_the_headphones()
     print("\nALL ROUTING LOGIC CHECKS PASSED")
 
 
