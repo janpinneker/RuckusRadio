@@ -69,6 +69,14 @@ def test_the_view_may_play_and_will_be_able_to_drive_music():
     print("die Ansicht darf abspielen: OK")
 
 
+def test_the_view_may_mute_discord_but_not_touch_outputs():
+    a = build()
+    assert a.may_send(access.ROLE_VIEW, p.SetDiscordSounds(False)), "Jan: mute Discord from the browser"
+    assert not a.may_send(access.ROLE_VIEW, p.SetOutput("CABLE", {"sounds": False}))
+    assert not a.may_send(access.ROLE_VIEW, p.ToggleMicMute())
+    print("die Ansicht darf Discord stummschalten, aber keine Ausgaenge aendern: OK")
+
+
 def test_the_view_may_not_manage_anything():
     a = build()
     for cmd in (p.AddSound("x", "X"), p.ImportPack("x"), p.ExportSounds("x"),
@@ -157,6 +165,7 @@ def main():
     test_unknown_capability_names_are_refused()
     test_tokens_resolve_to_roles()
     test_the_view_may_play_and_will_be_able_to_drive_music()
+    test_the_view_may_mute_discord_but_not_touch_outputs()
     test_the_view_may_not_manage_anything()
     test_the_view_may_browse_music()
     test_the_view_may_not_touch_the_music_account()

@@ -21,7 +21,8 @@ from .protocol import (
     ImportPack, InstallUpdate, Play, RegenerateViewToken, RemoveHotkey, RenameSound,
     RequestAddSound,
     RequestExportSounds, RequestImportPack, RequestSetSoundIcon, Rescan,
-    ResumeHotkeys, RunSignalCheck, SetAutostart, SetDiscordOutput, SetHotkey, SetLevels, SetMicrophone,
+    ResumeHotkeys, RunSignalCheck, SetAutostart, SetDiscordOutput, SetDiscordSounds,
+    SetHotkey, SetLevels, SetMicrophone,
     SetMusicBus, SetMusicBusGain, SetOutput, SetOnboardingActive, SetSoundIcon,
     SetSoundVolume, SetStopAllHotkey, ToggleMicMute,
     SpotifyLoadLibrary, SpotifyLoadPlaylist, SpotifyLogin, SpotifyLogout,
@@ -56,6 +57,9 @@ COMMAND_CAPABILITY: dict[type, str] = {
     # Musik-Bus (Ton anderer Apps): an/aus und Pegel sind Transport wie Play/Stop -
     # deshalb duerfen Fenster UND Ansicht beides (Spec "musik-bus-kern" §2).
     SetMusicBus: PLAYBACK, SetMusicBusGain: PLAYBACK,
+    # muting Discord is part of playing sounds for friends (Jan, 2026-09-27); it moves
+    # only the sounds switch of Discord's cable, never a level or a device
+    SetDiscordSounds: PLAYBACK,
     SuspendHotkeys: CAPTURE, ResumeHotkeys: CAPTURE,
     AddSound: LIBRARY, DeleteSound: LIBRARY, RenameSound: LIBRARY,
     SetSoundIcon: LIBRARY, SetSoundVolume: LIBRARY, SetHotkey: LIBRARY,

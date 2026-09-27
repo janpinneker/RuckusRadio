@@ -24,6 +24,7 @@ EXAMPLES = [
     p.SetLevels({"sounds_offset_db": -9.0}), p.SetMicrophone("Mikrofon (NVIDIA Broadcast)"),
     p.SetMicrophone("Mikrofon (NVIDIA Broadcast)", apply=False),
     p.SetDiscordOutput("Hi-Fi Cable Output (VB-Audio Hi-Fi Cable)"), p.SetDiscordOutput(""),
+    p.SetDiscordSounds(False), p.SetDiscordSounds(True),
     p.ToggleMicMute(), p.RunSignalCheck(), p.Rescan(), p.SetOnboardingActive(True),
     p.CompleteOnboarding(), p.SetAutostart(False),
     p.CheckForUpdates(), p.InstallUpdate(), p.RegenerateViewToken(),

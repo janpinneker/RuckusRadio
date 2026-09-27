@@ -161,6 +161,13 @@ class SetDiscordOutput(Command):
 
 
 @message
+class SetDiscordSounds(Command):
+    """Sounds on/off for the cable Discord records from - the dock button. Its own
+    command so the browser view may send it without SetOutput (levels, devices)."""
+    on: bool
+
+
+@message
 class ToggleMicMute(Command):
     pass
 

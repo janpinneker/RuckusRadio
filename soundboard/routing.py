@@ -18,7 +18,7 @@ from typing import Callable
 from . import config, defaultdevice, devices, levels, miccheck, sinkgroup
 from .layout import output_rows, virtual_mic_status
 from .protocol import (DevicesChanged, HeadphonesSwitched, Rescan, RunSignalCheck,
-                       SetDiscordOutput, SetLevels, SetMicrophone, SetOnboardingActive,
+                       SetDiscordOutput, SetDiscordSounds, SetLevels, SetMicrophone, SetOnboardingActive,
                        SetOutput, SignalCheckDone, ToggleMicMute)
 
 log = logging.getLogger(__name__)
@@ -88,6 +88,7 @@ class RoutingService:
         core.handle(SetLevels, self.set_levels)
         core.handle(SetMicrophone, self.set_microphone)
         core.handle(SetDiscordOutput, self.set_discord_output)
+        core.handle(SetDiscordSounds, self.set_discord_sounds)
         core.handle(ToggleMicMute, self.toggle_mic)
         core.handle(RunSignalCheck, self.run_signal_check)
         core.handle(Rescan, lambda _cmd: self.rescan())
@@ -313,6 +314,12 @@ class RoutingService:
         self.cfg["discord_output"] = cmd.key or None
         self._core.store.save_now()
         self._core.state_changed()
+
+    def set_discord_sounds(self, cmd: SetDiscordSounds) -> None:
+        key = self._discord_device_name()
+        if key is None:
+            return
+        self.set_output(SetOutput(key, {"sounds": bool(cmd.on)}))
 
     def _discord_device_name(self) -> str | None:
         """The cable Discord records from: the user's choice while that cable exists,

@@ -390,7 +390,29 @@ def test_discord_output_ignores_the_headphones():
     print("the headphones are never Discord's cable: OK")
 
 
+def test_discord_sounds_switch_the_cable_discord_records_from():
+    """The browser view may mute Discord (Jan, 2026-09-27) but not touch levels or
+    devices: SetDiscordSounds switches only the sounds of Discord's own cable."""
+    c, _events, backend = setup(start=False)
+    backend.resolved["virtual_mics"].append(
+        {"key": HIFI, "label": "Hi-Fi Cable", "out_index": 31, "in_index": 41,
+         "out_name": "Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)", "in_name": HIFI})
+    c.start()
+    sink = backend.sinks[0]
+    c.send(p.SetDiscordSounds(False))
+    assert sink.applied[-1][0] == CABLE and sink.applied[-1][1]["sounds"] is False
+    assert on_disk()["outputs"][CABLE]["sounds"] is False, "saved at once like the switch"
+    c.send(p.SetDiscordOutput(HIFI))
+    c.send(p.SetDiscordSounds(False))
+    assert sink.applied[-1][0] == HIFI and sink.applied[-1][1]["sounds"] is False
+    c.send(p.SetDiscordSounds(True))
+    assert on_disk()["outputs"][HIFI]["sounds"] is True
+    assert on_disk()["outputs"][CABLE]["sounds"] is False, "only Discord's cable moves"
+    print("Discord: Sounds switches exactly Discord's cable: OK")
+
+
 def main():
+    test_discord_sounds_switch_the_cable_discord_records_from()
     test_start_builds_the_mixer_and_describes_it()
     test_outputs_and_levels_reach_the_mixer()
     test_toggle_mic_mute()
