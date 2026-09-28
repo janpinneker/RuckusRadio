@@ -67,7 +67,7 @@ def test_assembled_core_handles_every_command_and_state_is_json():
     c.send(p.AddSound(str(core_fakes.FIXTURES / "test_tone.mp3"), "Airhorn"))
     state = c.state()
     assert set(state) == {"protocol", "playback", "jobs", "sounds", "devices", "settings",
-                          "updates", "spotify", "musicbus"}, set(state)
+                          "updates", "spotify", "spotify_player", "musicbus"}, set(state)
     json.dumps(p.to_json(p.StateChanged(state)))
     sound_id = state["sounds"][0]["id"]
     c.send(p.Play(sound_id))

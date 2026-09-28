@@ -117,6 +117,11 @@ class BridgeCore:
         with self._lock:
             return self._clients.get(client_id)
 
+    def viewer_count(self) -> int:
+        """Pages that asked for the state and are listening (Spotify polls only for them)."""
+        with self._lock:
+            return sum(1 for client in self._clients.values() if client.ready)
+
     # ---- client -> core ----
 
     def send(self, client_id: str, text: Any) -> dict:

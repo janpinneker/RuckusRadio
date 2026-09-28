@@ -208,6 +208,7 @@ class _FakeHttp:
     def __init__(self, answers):
         self._answers = answers
         self.requests = []
+        self.urls = []
 
     def _next(self, key):
         value = self._answers.get(key, (404, {"error": "not found"}))
@@ -219,6 +220,7 @@ class _FakeHttp:
         import io
         import urllib.error
         key = (request.get_method(), request.full_url.split("?")[0])
+        self.urls.append(request.full_url)
         self.requests.append((key[0], key[1], request.data, dict(request.header_items())))
         answer = self._next(key)
         status, body = answer[0], answer[1]
@@ -226,6 +228,10 @@ class _FakeHttp:
         if status >= 400:
             payload = json.dumps(body).encode("utf-8") if body else b""
             raise urllib.error.HTTPError(key[1], status, "err", headers, io.BytesIO(payload))
+        if status == 204:
+            return _Reply(b"")
+        if isinstance(body, bytes):  # a raw, non-JSON answer (Spotify's player does that)
+            return _Reply(body)
         return _Reply(json.dumps(body).encode("utf-8"))
 
 
@@ -516,6 +522,67 @@ def test_service_expired_login_clears_the_token():
     print("an expired login drops the token and says so: OK")
 
 
+def test_api_send_puts_json_and_takes_204():
+    api, tokens, http = _api_with({
+        ("POST", spotify.TOKEN_URL): (200, {"access_token": "a1", "expires_in": 3600}),
+        ("PUT", spotify.API_BASE + "/me/player/play"): (204, None),
+        ("PUT", spotify.API_BASE + "/me/player/shuffle"): (204, None),
+    })
+    tokens.save({"refresh_token": "r1"})
+    assert api.send("PUT", "/me/player/play", {"device_id": "d1"},
+                    {"uris": ["spotify:track:t1"]}) == {}
+    method, url, body, headers = http.requests[-1]
+    assert method == "PUT" and json.loads(body) == {"uris": ["spotify:track:t1"]}
+    assert headers.get("Content-type") == "application/json", headers
+    assert headers.get("Authorization") == "Bearer a1"
+    api.send("PUT", "/me/player/shuffle", {"state": True})
+    _m, _u, body, _h = http.requests[-1]
+    assert body == b"", "PUT without JSON still sends Content-Length 0"
+    assert http.urls[-1].endswith("?state=true"), http.urls[-1]
+    print("send puts JSON, answers 204 with {} and sends booleans as true/false: OK")
+
+
+def test_api_send_takes_a_non_json_success_as_done():
+    """Live 2026-09-28: PUT /me/player/pause answered 200 with a body that is no JSON;
+    the pause had worked, but the client reported "Spotify hat die Anfrage abgelehnt"."""
+    api, tokens, _http = _api_with({
+        ("POST", spotify.TOKEN_URL): (200, {"access_token": "a1", "expires_in": 3600}),
+        ("PUT", spotify.API_BASE + "/me/player/pause"): (200, b"ok"),
+        ("GET", spotify.API_BASE + "/me/player"): (200, b"not json"),
+    })
+    tokens.save({"refresh_token": "r1"})
+    assert api.send("PUT", "/me/player/pause") == {}
+    try:
+        api.get("/me/player")
+    except spotify.ApiError:
+        pass
+    else:
+        raise AssertionError("a GET still needs JSON - its answer is data")
+    print("a player command answered with a non-JSON 200 counts as done: OK")
+
+
+def test_api_send_names_premium_and_missing_device():
+    reason = lambda r: {"error": {"status": 403, "message": "x", "reason": r}}
+    api, tokens, _http = _api_with({
+        ("POST", spotify.TOKEN_URL): (200, {"access_token": "a1", "expires_in": 3600}),
+        ("PUT", spotify.API_BASE + "/me/player/pause"): (403, reason("PREMIUM_REQUIRED")),
+        ("POST", spotify.API_BASE + "/me/player/next"): (404, {"error": {"status": 404, "message": "x", "reason": "NO_ACTIVE_DEVICE"}}),
+        ("PUT", spotify.API_BASE + "/me/player/shuffle"): (403, reason("UNKNOWN")),
+    })
+    tokens.save({"refresh_token": "r1"})
+    for path, method, cls, text in (
+            ("/me/player/pause", "PUT", spotify.PremiumRequired, "Steuern braucht Spotify Premium."),
+            ("/me/player/next", "POST", spotify.NoDevice, "Öffne die Spotify-App auf diesem Rechner."),
+            ("/me/player/shuffle", "PUT", spotify.ApiError, "Spotify erlaubt das gerade nicht.")):
+        try:
+            api.send(method, path)
+        except cls as exc:
+            assert exc.text == text, exc.text
+        else:
+            raise AssertionError(path)
+    print("403/404 reasons become Premium, no device and a plain refusal: OK")
+
+
 def main():
     test_pkce()
     test_authorize_url()
@@ -528,6 +595,9 @@ def main():
     test_api_refreshes_once_after_a_401()
     test_api_reports_rate_limit_and_bad_status()
     test_api_keeps_the_spotify_reason_for_the_log()
+    test_api_send_puts_json_and_takes_204()
+    test_api_send_names_premium_and_missing_device()
+    test_api_send_takes_a_non_json_success_as_done()
     test_service_without_client_id_reports_it()
     test_service_search_needs_a_connection()
     test_service_searches_and_keeps_the_token_out_of_the_state()

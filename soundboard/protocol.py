@@ -286,6 +286,71 @@ class SpotifyLoadPlaylist(Command):
     offset: int = 0
 
 
+# ---- Spotify F2: Wiedergabe (Spec §13.2). Alles PLAYBACK in access.py. ----
+
+@message
+class SpotifyPlay(Command):
+    uris: tuple[str, ...] = ()   # einzelne Titel
+    context_uri: str = ""        # Playlist/Album
+    offset_uri: str = ""         # Starttitel im Kontext
+
+
+@message
+class SpotifyPause(Command):
+    pass
+
+
+@message
+class SpotifyResume(Command):
+    pass
+
+
+@message
+class SpotifyNext(Command):
+    pass
+
+
+@message
+class SpotifyPrevious(Command):
+    pass
+
+
+@message
+class SpotifySeek(Command):
+    position_ms: int
+
+
+@message
+class SpotifySetVolume(Command):
+    volume_percent: int          # auf 0..100 geklemmt
+
+
+@message
+class SpotifySetShuffle(Command):
+    on: bool
+
+
+@message
+class SpotifySetRepeat(Command):
+    mode: str                    # off | context | track
+
+
+@message
+class SpotifyAddToQueue(Command):
+    uri: str
+
+
+@message
+class SpotifyTransfer(Command):
+    device_id: str
+    play: bool = True
+
+
+@message
+class SpotifyLoadDevices(Command):
+    pass
+
+
 # ---- events: core -> interface ----
 
 @message

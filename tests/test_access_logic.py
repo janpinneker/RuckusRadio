@@ -112,6 +112,27 @@ def test_the_view_may_browse_music():
     print("die Ansicht darf Musik durchsuchen und ansehen: OK")
 
 
+PLAYER_COMMANDS = (
+    p.SpotifyPlay(uris=("spotify:track:t1",)), p.SpotifyPlay(context_uri="spotify:playlist:x"),
+    p.SpotifyPause(), p.SpotifyResume(), p.SpotifyNext(), p.SpotifyPrevious(),
+    p.SpotifySeek(1000), p.SpotifySetVolume(50), p.SpotifySetShuffle(True),
+    p.SpotifySetRepeat("track"), p.SpotifyAddToQueue("spotify:track:t1"),
+    p.SpotifyTransfer("dev1"), p.SpotifyLoadDevices(),
+)
+
+
+def test_the_view_may_drive_spotify_playback():
+    """Transport ist Abspielen (Spec §13.1): die Ansicht im Steam-Overlay darf steuern."""
+    a = build()
+    for cmd in PLAYER_COMMANDS:
+        assert access.COMMAND_CAPABILITY[type(cmd)] == access.PLAYBACK, cmd
+        assert a.may_send(access.ROLE_VIEW, cmd), cmd
+        assert a.may_send(access.ROLE_WINDOW, cmd), cmd
+    again = p.from_json(p.to_json(p.SpotifyPlay(uris=("a", "b"))))
+    assert again.uris == ("a", "b"), again
+    print("die Ansicht darf Spotify steuern: OK")
+
+
 def test_the_view_may_not_touch_the_music_account():
     """Anmelden und abmelden bleibt Fenster-Sache: der Ansichtsschluessel ist dauerhaft
     und liegt in einem Lesezeichen - damit darf niemand ein Konto verbinden."""
@@ -168,6 +189,7 @@ def main():
     test_the_view_may_mute_discord_but_not_touch_outputs()
     test_the_view_may_not_manage_anything()
     test_the_view_may_browse_music()
+    test_the_view_may_drive_spotify_playback()
     test_the_view_may_not_touch_the_music_account()
     test_the_window_may_send_everything()
     test_the_view_token_survives_a_restart_and_can_be_rotated()

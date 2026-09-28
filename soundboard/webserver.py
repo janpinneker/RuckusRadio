@@ -444,7 +444,11 @@ class SseServer:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
-                self.send_header("Connection", "keep-alive")
+                # A stream has no length, so its end is the end of the connection: without
+                # "close", HTTP/1.1 would wait for a next request on the socket and a stream
+                # cut off by a rotated key would just hang open in the old tab. (The header
+                # also sets close_connection; EventSource does not care about it.)
+                self.send_header("Connection", "close")
                 self.end_headers()
                 try:
                     while True:

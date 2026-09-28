@@ -109,6 +109,17 @@ class ApiError(SpotifyError):
     text = "Spotify hat die Anfrage abgelehnt."
 
 
+class PremiumRequired(ApiError):
+    text = "Steuern braucht Spotify Premium."
+
+
+class NoDevice(ApiError):
+    text = "Öffne die Spotify-App auf diesem Rechner."
+
+
+REFUSED = "Spotify erlaubt das gerade nicht."
+
+
 # ---- pure helpers (no network) ----
 
 def make_verifier() -> str:
@@ -313,11 +324,13 @@ class SpotifyApi:
         return urllib.request.urlopen(request, timeout=timeout)
 
     def _request(self, method: str, url: str, *, data: dict | None = None,
-                 headers: dict | None = None) -> dict:
+                 headers: dict | None = None, body: bytes | None = None,
+                 lenient: bool = False) -> dict:
         import http.client
         import urllib.error
         import urllib.request
-        body = urlencode(data).encode("ascii") if data is not None else None
+        if data is not None:
+            body = urlencode(data).encode("ascii")
         request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
         try:
             with self._http(request, self._timeout) as resp:
@@ -331,6 +344,10 @@ class SpotifyApi:
         try:
             return json.loads(raw.decode("utf-8")) if raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if lenient:
+                # A player command is done once Spotify says 2xx; its body is no data
+                # (live 2026-09-28: pause answered 200 with a body that was no JSON).
+                return {}
             raise ApiError(detail=str(exc)) from exc
 
     @staticmethod
@@ -354,6 +371,18 @@ class SpotifyApi:
             raise RateLimitError(seconds, detail=detail)
         if exc.code == 401:
             raise AuthError(detail=detail)
+        if exc.code in (403, 404):
+            reason = ""
+            try:
+                reason = str((json.loads(body) or {}).get("error", {}).get("reason") or "")
+            except (ValueError, AttributeError):
+                pass
+            if reason == "PREMIUM_REQUIRED":
+                raise PremiumRequired(detail=detail)
+            if reason == "NO_ACTIVE_DEVICE":
+                raise NoDevice(detail=detail)
+            if exc.code == 403:
+                raise ApiError(REFUSED, detail=detail)
         if exc.code >= 500:
             raise NetworkError(f"Spotify antwortet nicht ({exc.code}).", detail=detail)
         raise ApiError(f"Spotify hat die Anfrage abgelehnt ({exc.code}).", detail=detail)
@@ -411,17 +440,41 @@ class SpotifyApi:
 
     # ---- api ----
 
-    def get(self, path: str, params: dict | None = None) -> dict:
-        url = API_BASE + path
-        if params:
-            url += "?" + urlencode({k: v for k, v in params.items() if v is not None})
+    def _authorized(self, method: str, url: str, body: bytes | None, json_type: bool,
+                    lenient: bool = False) -> dict:
         self._ensure_token()
+
+        def once() -> dict:
+            headers = {"Authorization": f"Bearer {self._access}"}
+            if json_type:
+                headers["Content-Type"] = "application/json"
+            return self._request(method, url, headers=headers, body=body, lenient=lenient)
         try:
-            return self._request("GET", url, headers={"Authorization": f"Bearer {self._access}"})
+            return once()
         except AuthError:
             self._access = None
             self.refresh()  # exactly one retry after a refresh
-            return self._request("GET", url, headers={"Authorization": f"Bearer {self._access}"})
+            return once()
+
+    @staticmethod
+    def _url(path: str, params: dict | None) -> str:
+        url = API_BASE + path
+        if params:
+            clean = {k: (str(v).lower() if isinstance(v, bool) else v)
+                     for k, v in params.items() if v is not None}
+            url += "?" + urlencode(clean)
+        return url
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        return self._authorized("GET", self._url(path, params), None, False)
+
+    def send(self, method: str, path: str, params: dict | None = None,
+             json_body: dict | None = None) -> dict:
+        """PUT/POST to the player. Spotify answers most of them with 204 -> {}.
+        A PUT without JSON still carries an empty body: Spotify wants Content-Length."""
+        body = json.dumps(json_body).encode("utf-8") if json_body is not None else b""
+        return self._authorized(method, self._url(path, params), body, json_body is not None,
+                                lenient=True)
 
     def get_user(self) -> dict:
         return self.get("/me")
@@ -509,6 +562,15 @@ class SpotifyService:
         core.on_shutdown(self._close_listener)
 
     # ---- lifecycle ----
+
+    @property
+    def api(self):
+        """The shared SpotifyApi (built once the client id is known) - F2 uses it too."""
+        return self._api
+
+    def report(self, error: SpotifyError) -> None:  # core
+        """Same handling as a failed search: an AuthError drops the login."""
+        self._failed(error)
 
     def _read_client_id(self) -> None:
         self.tokens.migrate_legacy()  # one-time, from the pre-secrets-store version

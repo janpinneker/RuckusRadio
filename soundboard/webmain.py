@@ -204,6 +204,9 @@ def run(core=None, on_window=None, serve_only: bool = False, show=console_show,
     spotify = getattr(core, "spotify", None)
     if spotify is not None:
         spotify.attach_server(server)
+    player = getattr(core, "spotify_player", None)
+    if player is not None:
+        player.attach_viewers(bridge.viewer_count)  # poll Spotify only while a page watches
     bridge.add_client("window", bridge.window_token)
     threading.Thread(target=server.serve_forever, name="ruckus-server", daemon=True).start()
     _wait_for_port(server)

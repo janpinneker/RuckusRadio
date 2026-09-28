@@ -27,6 +27,9 @@ from .protocol import (
     SetSoundVolume, SetStopAllHotkey, ToggleMicMute,
     SpotifyLoadLibrary, SpotifyLoadPlaylist, SpotifyLogin, SpotifyLogout,
     SpotifySearch, SpotifySearchMore, Stop, StopAll, SuspendHotkeys,
+    SpotifyPlay, SpotifyPause, SpotifyResume, SpotifyNext, SpotifyPrevious,
+    SpotifySeek, SpotifySetVolume, SpotifySetShuffle, SpotifySetRepeat,
+    SpotifyAddToQueue, SpotifyTransfer, SpotifyLoadDevices,
 )
 
 log = logging.getLogger(__name__)
@@ -81,8 +84,11 @@ COMMAND_CAPABILITY: dict[type, str] = {
     SpotifySearch: MUSIC, SpotifySearchMore: MUSIC,
     SpotifyLoadLibrary: MUSIC, SpotifyLoadPlaylist: MUSIC,
     SpotifyLogin: MUSIC_ACCOUNT, SpotifyLogout: MUSIC_ACCOUNT,
-    # Der Transport (Pause, Weiter, Geraetewahl) gehoert spaeter zu PLAYBACK, damit er
-    # in beiden Rollen funktioniert, ohne die Rollen anzufassen (Spec §11).
+    # F2-Transport (Spec §13.1): PLAYBACK, damit auch die Ansicht steuern darf.
+    SpotifyPlay: PLAYBACK, SpotifyPause: PLAYBACK, SpotifyResume: PLAYBACK,
+    SpotifyNext: PLAYBACK, SpotifyPrevious: PLAYBACK, SpotifySeek: PLAYBACK,
+    SpotifySetVolume: PLAYBACK, SpotifySetShuffle: PLAYBACK, SpotifySetRepeat: PLAYBACK,
+    SpotifyAddToQueue: PLAYBACK, SpotifyTransfer: PLAYBACK, SpotifyLoadDevices: PLAYBACK,
 }
 
 ROLE_CAPABILITIES: dict[str, frozenset] = {

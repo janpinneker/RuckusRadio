@@ -51,6 +51,10 @@ UPDATE_DONE = "Ruckus Radio wurde auf {version} aktualisiert."
 WHATS_NEW = {
     "1.2.0": ("Neu: die Web-Oberfläche ist jetzt Standard. Die gewohnte Oberfläche startest "
               "du über „Ruckus Radio (klassisch)“ im Startmenü."),
+    "1.3.0": ("Neu: Spotify aus Ruckus steuern – Abspielen, Pause, Titel wechseln, Gerät und "
+              "Lautstärke, auch aus der Browser-Ansicht. Braucht Spotify Premium und die "
+              "geöffnete Spotify-App. Und: „Musik ins Mikrofon“ auf der Musik-Seite lässt "
+              "deine Mitspieler mithören."),
 }
 
 

@@ -383,6 +383,47 @@ def test_state_carries_role_and_view_url_and_a_rotated_key_kills_the_stream():
     print("/state nennt Rolle und Link, ein erneuerter Schluessel toetet den alten: OK")
 
 
+def test_the_heartbeat_ends_a_view_stream_whose_key_was_rotated():
+    """The stream check lives in the keepalive branch (webserver._events): an open view
+    stream must end on the next heartbeat after the key rotates, the window stream not."""
+    KEEPALIVE = b": keepalive\n"
+    BLANK = b"\n"
+    saved = webserver.HEARTBEAT_S
+    webserver.HEARTBEAT_S = 0.1
+    h = Harness()
+    try:
+        def open_stream(token):
+            conn = http.client.HTTPConnection("127.0.0.1", h.server.port, timeout=5)
+            conn.request("GET", f"/events?token={token}", headers={"Origin": h.origin})
+            response = conn.getresponse()
+            assert response.status == 200
+            return conn, response
+
+        view_conn, view = open_stream(h.bridge.view_token)
+        window_conn, window = open_stream(h.bridge.window_token)
+        assert view.fp.readline() == KEEPALIVE  # alive before the rotation
+        h.bridge.rotate_view_token()
+        deadline = time.monotonic() + 3.0
+        ended = False
+        while time.monotonic() < deadline:
+            if view.fp.readline() == b"":
+                ended = True
+                break
+        assert ended, "the old view stream kept running after the key rotated"
+        # the window stream lives on: lines read well after the rotation are still heartbeats
+        # (the first one sat in the buffer from before it, so keep reading for a while)
+        after = time.monotonic() + 3 * webserver.HEARTBEAT_S
+        while time.monotonic() < after:
+            line = window.fp.readline()
+            assert line in (KEEPALIVE, BLANK), line  # b"" would mean it ended
+        view_conn.close()
+        window_conn.close()
+    finally:
+        webserver.HEARTBEAT_S = saved
+        h.stop()
+    print("der Herzschlag beendet den Strom eines erneuerten Ansichtsschluessels: OK")
+
+
 def test_an_extra_route_can_be_registered():
     h = Harness()
     try:
@@ -609,6 +650,7 @@ def main():
     test_the_view_may_not_delete_over_http_but_may_play()
     test_no_command_beyond_playback_and_music_reaches_the_view()
     test_state_carries_role_and_view_url_and_a_rotated_key_kills_the_stream()
+    test_the_heartbeat_ends_a_view_stream_whose_key_was_rotated()
     test_an_extra_route_can_be_registered()
     test_the_event_stream_pushes_events()
     test_a_held_notice_arrives_on_the_window_stream()

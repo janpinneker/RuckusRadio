@@ -52,6 +52,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ducking_db": -6.0,
     # Spotify's public client id (PKCE, no secret). Empty = the music tab shows a hint.
     "spotify_client_id": "",
+    # F2: last chosen Spotify Connect device (only the id, spec §13.3)
+    "spotify_device_id": "",
     # The local server's port. The Spotify redirect callback is the server's own route
     # (127.0.0.1:47800/callback), so a user-changed port must round-trip through here -
     # the dashboard knows exactly one URL, and `spotify._callback_url` checks the port.

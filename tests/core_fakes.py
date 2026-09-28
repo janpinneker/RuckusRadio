@@ -262,7 +262,8 @@ class FakeSpotifyApi:
     """Stands in for SpotifyApi: no network. `fail` raises on any call."""
 
     def __init__(self, user=None, search=None, tracks=None, playlists=None, fail=None,
-                 has_more=False, playlist_items=None):
+                 has_more=False, playlist_items=None, player=None, devices=None,
+                 send_fail=None, on_send=None):
         self.user = user if user is not None else {
             "display_name": "Jan", "images": [{"url": "https://i.scdn.co/u"}]}
         self.search_items = list(search or [])
@@ -274,6 +275,22 @@ class FakeSpotifyApi:
         self.fail = fail
         self.calls: list[tuple] = []
         self.logins: list[tuple] = []
+        self.player = dict(player) if player else {}          # GET /me/player
+        self.devices = list(devices or [])                    # GET /me/player/devices, Spotify shape
+        self.send_fail = send_fail   # exception, or dict {(method, path): exception}
+        self.on_send = on_send       # hook for re-entrancy (seek/volume coalescing)
+        self.sent: list[tuple] = []
+
+    def send(self, method, path, params=None, json_body=None):
+        self.sent.append((method, path, dict(params or {}), json_body))
+        if self.on_send is not None:
+            self.on_send(method, path, params)
+        fail = self.send_fail
+        if isinstance(fail, dict):
+            fail = fail.pop((method, path), None)
+        if fail is not None:
+            raise fail
+        return {}
 
     def begin_login(self, verifier, state, redirect=""):
         self.logins.append((verifier, state, redirect))
@@ -314,6 +331,10 @@ class FakeSpotifyApi:
                         "next": "x" if self.has_more else None,
                         "total": len(self.playlist_items)}
             return {"id": path.split("/")[2], "name": "Fokus"}
+        if path == "/me/player":
+            return dict(self.player)
+        if path == "/me/player/devices":
+            return {"devices": list(self.devices)}
         return {}
 
 

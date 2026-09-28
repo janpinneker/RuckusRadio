@@ -1,6 +1,18 @@
 r"""Manueller Ende-zu-Ende-Test der Spotify-Anmeldung - echter Browser, echtes Spotify.
 
-    venv\Scripts\python.exe tests\test_spotify_manual.py [--fresh-login]
+    venv\Scripts\python.exe tests\test_spotify_manual.py [--fresh-login] [--player]
+
+**Warum ``--player`` existiert.** Prueft F2 - die Fernbedienung des echten Spotify-
+Players (``/me/player*``) - mit echten Befehlen: Geraete lesen, aktueller Titel, ein
+echtes Pause/Play und eine echte Lautstaerkeaenderung (danach sofort zurueckgesetzt).
+Pause/Play stellt den Zustand wieder her, den es vorfindet: laeuft etwas, heisst es
+Pause -> Play; laeuft nichts, Play -> Pause (die Wiedergabe bleibt danach also aus).
+**Nur zusammen mit Jan ausfuehren:** es pausiert und startet die *echte* Wiedergabe auf
+seinem Geraet. Voraussetzungen: ausserhalb der Sandbox (die mutet Audio-Aufnahme, siehe
+Projektnotizen - hier aber ohnehin nur HTTP, kein Ton), die Spotify-App auf dem
+Zielgeraet **offen** und ein **Premium**-Konto (Steuerbefehle lehnt Spotify sonst mit
+``PREMIUM_REQUIRED`` ab). Ohne gespeicherten Login (kein Token in der Temp-Kopie) wird
+der Schritt uebersprungen - er baut keinen eigenen Anmeldelauf auf.
 
 **Warum ``--fresh-login`` existiert.** Das Skript kopiert die echte ``secrets.json`` mit,
 also startet der Kern mit gespeichertem Token als ``connected=True`` und die Anmeldung
@@ -418,6 +430,112 @@ def login_and_probe(client_id: str, origin: str, fresh_login: bool = False) -> b
     return True
 
 
+def build_player_api(client_id: str):
+    """Ein echtes ``spotify.SpotifyApi`` aus dem gespeicherten Token der Temp-Kopie.
+
+    ``None``, wenn kein Login gespeichert ist (z. B. nach ``--fresh-login`` ohne
+    abgeschlossene Anmeldung) - dann baut ``--player`` keinen eigenen Anmeldelauf auf,
+    er ueberspringt einfach. Liest nur die Temp-Kopie von ``secrets.json``
+    (``_DATA_DIR``, siehe Modul-Docstring) - nie das echte Verzeichnis.
+    """
+    from soundboard import store as store_mod
+    tokens = spotify.TokenStore(store_mod.Store(None, data=config._default_config()))
+    if not tokens.load():
+        return None
+    return spotify.SpotifyApi(client_id, tokens)
+
+
+def probe_player(api) -> bool:
+    """``--player``: echte Geraete, echter Titel, ein echtes Pause/Play/Volume.
+
+    Jeder Schritt meldet sich einzeln (``OK ...`` / ``FEHLER ...: <exc.text>``, nie ein
+    Token). Rueckgabe True nur, wenn alle vier Schritte liefen.
+    """
+    from soundboard import spotify_player as sp
+
+    print()
+    print("=" * 78)
+    print("Spieler (--player): Geraete, aktueller Titel, Pause/Play, Lautstaerke")
+    print("=" * 78)
+    ok = True
+
+    # 1) Geraete
+    current_volume: int | None = None
+    device_supports_volume = False
+    was_playing = False
+    try:
+        payload = api.get("/me/player/devices")
+        devices = [sp.map_device(d) for d in (payload.get("devices") or [])]
+        if devices:
+            for d in devices:
+                print(f"                  {d['name']!r} ({d['type']}) "
+                      f"{'aktiv' if d['active'] else 'inaktiv'}, "
+                      f"Lautstaerke={d['volume_percent']}")
+        else:
+            print("                  keine Geraete gemeldet")
+        print("OK Geraete gelesen")
+    except spotify.SpotifyError as exc:
+        print(f"FEHLER Geraete gelesen: {exc.text}  [Detail: {exc.detail or "-"}]")
+        return False
+
+    # 2) Aktueller Titel
+    try:
+        raw = api.get("/me/player")
+        state = sp.map_player(raw, time.time())
+        track = state["track"]
+        was_playing = bool(state["is_playing"])
+        if track:
+            print(f"                  laeuft: {track['title']!r} von {track['artist']!r}")
+        else:
+            print("                  nichts laeuft")
+        if state["device"]:
+            current_volume = state["device"]["volume_percent"]
+            device_supports_volume = state["device"]["supports_volume"]
+        print("OK aktueller Titel gelesen")
+    except spotify.SpotifyError as exc:
+        print(f"FEHLER aktueller Titel gelesen: {exc.text}  [Detail: {exc.detail or "-"}]")
+        return False
+
+    # 3) Umschalten und zurueck (kein Body): endet im vorgefundenen Zustand, damit ein
+    #    Prueflauf nie Musik startet, die vorher aus war.
+    first, second = ("pause", "play") if was_playing else ("play", "pause")
+    label = f"{first.capitalize()}/{second.capitalize()}"
+    print(f"                  {'laeuft' if was_playing else 'laeuft nicht'} -> {label}, "
+          f"danach wieder {'an' if was_playing else 'aus'}")
+    flipped = False
+    try:
+        api.send("PUT", f"/me/player/{first}")
+        flipped = True
+        time.sleep(2.0)
+        api.send("PUT", f"/me/player/{second}")
+        flipped = False
+        print(f"OK {label}")
+    except spotify.SpotifyError as exc:
+        print(f"FEHLER {label}: {exc.text}  [Detail: {exc.detail or "-"}]")
+        ok = False
+    finally:
+        if flipped:  # the first call went through: put the state back, best effort
+            try:
+                api.send("PUT", f"/me/player/{second}")
+                print(f"                  zurueckgesetzt ({second})")
+            except spotify.SpotifyError as exc:
+                print(f"FEHLER zuruecksetzen ({second}): {exc.text}")
+
+    # 4) Lautstaerke zurueck auf den gemerkten Wert - nur wenn das Geraet sie unterstuetzt
+    if current_volume is None or not device_supports_volume:
+        print("                  Lautstaerke uebersprungen - Geraet unterstuetzt sie nicht "
+              "oder unbekannt")
+    else:
+        try:
+            api.send("PUT", "/me/player/volume", params={"volume_percent": current_volume})
+            print(f"OK Lautstaerke zurueck auf {current_volume}")
+        except spotify.SpotifyError as exc:
+            print(f"FEHLER Lautstaerke zurueck auf {current_volume}: {exc.text}  [Detail: {exc.detail or "-"}]")
+            ok = False
+
+    return ok
+
+
 def main() -> int:
     # Spotify's own reason ("invalid_client", "redirect_uri mismatch") is logged, not
     # shown in the interface - so show the log here.
@@ -451,7 +569,18 @@ def main() -> int:
         print("  3. Dieses Skript erneut starten.")
         return 2
 
-    return 0 if login_and_probe(client_id, origin, fresh_login) else 1
+    exit_code = 0 if login_and_probe(client_id, origin, fresh_login) else 1
+
+    if "--player" in sys.argv[1:]:
+        api = build_player_api(client_id)
+        if api is None:
+            print()
+            print("Spieler (--player): uebersprungen - kein gespeicherter Spotify-Login "
+                  "in der Temp-Kopie.")
+        elif not probe_player(api):
+            exit_code = 1
+
+    return exit_code
 
 
 if __name__ == "__main__":

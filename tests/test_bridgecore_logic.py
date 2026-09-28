@@ -20,6 +20,7 @@ logging.getLogger("soundboard").addHandler(logging.NullHandler())
 from soundboard import access  # noqa: E402
 from soundboard import protocol as p  # noqa: E402
 from soundboard.bridgecore import MAX_PENDING, BridgeCore  # noqa: E402
+import core_fakes  # noqa: E402
 
 
 class FakeCore:
@@ -302,7 +303,21 @@ def test_a_held_notice_reaches_the_first_window_stream_once():
     print("ein Start-Hinweis erreicht einmal den ersten Fenster-Strom: OK")
 
 
+def test_viewer_count_counts_ready_clients():
+    c, _ = core_fakes.make_core()
+    bridge = BridgeCore(c, lambda *_: None)
+    assert bridge.viewer_count() == 0
+    bridge.add_client("w", bridge.window_token)
+    assert bridge.viewer_count() == 0, "a client counts once its page asked for the state"
+    bridge.mark_ready("w")
+    assert bridge.viewer_count() == 1
+    bridge.remove_client("w")
+    assert bridge.viewer_count() == 0
+    print("viewer_count counts ready clients: OK")
+
+
 def main():
+    test_viewer_count_counts_ready_clients()
     test_a_held_notice_reaches_the_first_window_stream_once()
     test_two_roles_and_unknown_keys_are_refused()
     test_the_view_client_cannot_manage_but_may_play()

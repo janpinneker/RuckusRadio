@@ -67,6 +67,7 @@ class Core:
         self.settings = None
         self.updates = None
         self.spotify = None
+        self.spotify_player = None
         self.musicbus = None
         self._handlers: dict[type, Callable[[Any], None]] = {}
         self._state_parts: dict[str, Callable[[], Any]] = {}
@@ -347,5 +348,7 @@ def create_core(*, inline: bool = False, engine=None, backend=None, hotkey_manag
         core.settings = AppSettingsService(core, autostart_module)
     core.updates = UpdateService(core, update_source, update_dir)
     core.spotify = SpotifyService(core, api=spotify_api)
+    from .spotify_player import SpotifyPlayerService
+    core.spotify_player = SpotifyPlayerService(core, core.spotify)
     core.musicbus = MusicBusService(core, factory=musicbus_factory)
     return core

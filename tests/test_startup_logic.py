@@ -139,6 +139,10 @@ def test_an_update_run_brings_one_notice_with_whats_new():
     [text] = app_main.startup_notices(["--updated"], "1.2.0")
     assert "1.2.0" in text
     assert "Web-Oberfläche" in text and "(klassisch)" in text, text
+    [spotify] = app_main.startup_notices(["--updated"], "1.3.0")
+    assert "1.3.0" in spotify and "Spotify" in spotify and "Premium" in spotify, spotify
+    assert "Browser" in spotify, "the view link may steer too - say so"
+    assert "Musik ins Mikrofon" in spotify, "the music bus is new in 1.3.0 too"
     [plain] = app_main.startup_notices(["--updated"], "9.9.9")
     assert "9.9.9" in plain and "Web-Oberfläche" not in plain, "no news without an entry"
     assert app_main.parse_mode(["--updated"]) == "web", "--updated changes no start path"
