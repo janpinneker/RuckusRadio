@@ -3,6 +3,8 @@ independent volumes (VoiceMeeter Input + local monitor)."""
 
 from __future__ import annotations
 
+import os
+import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,7 @@ from pydub import AudioSegment
 
 from soundboard.config import MONITOR_KEY
 from soundboard.paths import configure_ffmpeg
+from soundboard import trimming
 
 # Must run before any AudioSegment decode/export below: points pydub at the
 # bundled ffmpeg/ffprobe when frozen, else leaves system PATH resolution alone.
@@ -38,11 +41,12 @@ def extract_audio(src_path: str | Path, dest_path: str | Path, fmt: str = "mp3")
     return dest_path
 
 
-def decode_audio(path: str | Path) -> DecodedSound:
+def decode_audio(path: str | Path, trim: dict | None = None) -> DecodedSound:
     """Decode an MP3 or MP4 file to float32 PCM via ffmpeg/pydub.
 
     For MP4 input, pydub/ffmpeg extracts only the audio stream — no video
-    is ever decoded or rendered.
+    is ever decoded or rendered. `trim` (C8) cuts the decoded samples - no second
+    ffmpeg run; None plays the whole file.
     """
     segment = AudioSegment.from_file(str(path))
     segment = segment.set_frame_rate(TARGET_SAMPLERATE).set_channels(TARGET_CHANNELS)
@@ -51,7 +55,49 @@ def decode_audio(path: str | Path) -> DecodedSound:
     max_value = float(1 << (8 * segment.sample_width - 1))
     samples = raw.astype(np.float32) / max_value
     samples = samples.reshape(-1, TARGET_CHANNELS)
-    return DecodedSound(samples=samples, samplerate=TARGET_SAMPLERATE)
+    return DecodedSound(samples=trimming.apply_trim(samples, TARGET_SAMPLERATE, trim),
+                        samplerate=TARGET_SAMPLERATE)
+
+
+def export_trimmed(src_path: str | Path, dest_path: str | Path, trim: dict | None) -> Path:
+    """Write the cut part of `src_path` as a new MP3 ("Als neue Datei exportieren…").
+    Without a trim the file is copied unchanged - no re-encoding.
+
+    K5: a start at or beyond the (clamped) end - e.g. a stored trim's start past the
+    file's end, foreign/corrupt pack data - exports the whole file instead of a
+    silent/near-empty MP3, the same "better the whole sound than silence" rule
+    `trimming.apply_trim` already uses for playback (they must not disagree).
+
+    Exports to a temp file next to `dest_path` and `os.replace`s it in on success, so a
+    failed encode (pydub opens the destination before it writes anything) never leaves
+    a 0-byte or partial file behind; the temp file is unlinked on failure."""
+    src_path = Path(src_path)
+    dest_path = Path(dest_path)
+    if dest_path.resolve() == src_path.resolve():
+        raise ValueError("export_trimmed must not overwrite the source file")
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_path.with_name(dest_path.name + ".tmp")
+    cut = trimming.clean_trim(trim)
+    try:
+        segment = None
+        clamped = None
+        if cut is not None:
+            segment = AudioSegment.from_file(str(src_path))
+            clamped = trimming.clamp_trim_seconds(cut, len(segment) / 1000.0)
+        if clamped is None:
+            if segment is None:
+                shutil.copyfile(src_path, tmp_path)
+            else:
+                segment.export(str(tmp_path), format="mp3")
+        else:
+            start_s, end_s = clamped
+            part = segment[int(round(start_s * 1000)):int(round(end_s * 1000))]
+            part.export(str(tmp_path), format="mp3")
+        os.replace(tmp_path, dest_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return dest_path
 
 
 class _StreamPlayback:
@@ -105,10 +151,16 @@ class _SinkPlayback:
     own OutputStream it feeds a sink (a `sinkgroup.SinkGroup`) that already owns one.
     Used whenever mic and sounds have to leave through a single mixed stream."""
 
-    def __init__(self, sink, samples: np.ndarray, gain: float, only: str | None = None):
+    def __init__(self, sink, samples: np.ndarray, gain: float, only: str | None = None,
+                 music: bool = False):
         self._sink = sink
-        self._source = (sink.add_source(samples, gain, only=only) if only is not None
-                        else sink.add_source(samples, gain))
+        # Only pass what is set: older sink doubles know neither keyword.
+        kwargs: dict = {}
+        if only is not None:
+            kwargs["only"] = only
+        if music:
+            kwargs["music"] = True
+        self._source = sink.add_source(samples, gain, **kwargs)
         self.finished = self._source.finished
 
     def start(self):
@@ -164,8 +216,8 @@ class AudioEngine:
         self._lock = threading.Lock()
         self._cache: dict[str, DecodedSound] = {}
 
-    def preload(self, sound_id: str, path: str | Path) -> None:
-        decoded = decode_audio(path)  # slow part, outside the lock
+    def preload(self, sound_id: str, path: str | Path, trim: dict | None = None) -> None:
+        decoded = decode_audio(path, trim)  # slow part, outside the lock
         with self._lock:
             self._cache[sound_id] = decoded
 
@@ -190,24 +242,48 @@ class AudioEngine:
             targets.append((self.monitor_device, volume * self.monitor_volume))
         return targets
 
-    def play(self, sound_id: str, volume: float = 1.0, monitor_only: bool = False) -> ActivePlayback:
+    def play(self, sound_id: str, volume: float = 1.0, monitor_only: bool = False,
+             music: bool = False) -> ActivePlayback | None:
         """Raises KeyError if not preloaded, sd.PortAudioError if a device fails
         (any stream already opened for this play is closed first). `monitor_only`:
-        a preview - the headphones hear it, the voice chat does not."""
+        a preview - the headphones hear it, the voice chat does not. `music`:
+        Klangbild-Kategorie, the sink mixes it with the music offset.
+
+        K6: None when there is no target at all (no headphone, no sink/mixer) -
+        nothing is started, so the caller must not report a play as started."""
         with self._lock:
             decoded = self._cache[sound_id]
+        return self._start(sound_id, decoded.samples, decoded.samplerate, volume,
+                           monitor_only, music)
 
+    def play_clip(self, sound_id: str, samples: np.ndarray, volume: float = 1.0) -> ActivePlayback | None:
+        """Trim preview (C8 Z3): exactly these frames, only on the headphones, tracked
+        under `sound_id` so Stop(sound_id) and "spielt gerade" work like any play. Never
+        music for the cables: a preview is never mixed with the music offset.
+
+        K6: None without a headphone/monitor device and without a running sink/mixer -
+        there is nothing to preview on, so nothing starts (see `_start`)."""
+        return self._start(sound_id, samples, TARGET_SAMPLERATE, volume,
+                           monitor_only=True, music=False)
+
+    def _start(self, sound_id: str, samples: np.ndarray, samplerate: int, volume: float,
+              monitor_only: bool, music: bool = False) -> ActivePlayback | None:
         sink = self.sink if self.sink is not None and self.sink.running else None
         targets = self._targets_for(volume, monitor_only)
+        if sink is None and not targets:
+            # K6: no headphone, no mixer - an ActivePlayback with zero streams would
+            # instantly report "finished" (all() of an empty list) while briefly
+            # counting as "spielt"; nothing to start, so nothing is created.
+            return None
 
         streams: list = []
         playback = ActivePlayback(sound_id, streams)
         try:
             if sink is not None:
-                streams.append(_SinkPlayback(sink, decoded.samples, volume,
-                                             MONITOR_KEY if monitor_only else None))
+                streams.append(_SinkPlayback(sink, samples, volume,
+                                             MONITOR_KEY if monitor_only else None, music))
             for device, gain in targets:
-                streams.append(_StreamPlayback(decoded.samples, decoded.samplerate, device, gain))
+                streams.append(_StreamPlayback(samples, samplerate, device, gain))
             playback.start()
         except Exception:
             playback.stop()

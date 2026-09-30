@@ -84,13 +84,16 @@ def test_the_view_may_not_manage_anything():
                 p.SetSoundVolume("s", 0.5), p.SetHotkey("s", "k"), p.RemoveHotkey("s"),
                 p.SetStopAllHotkey("k"),
                 p.SetLevels({"sounds_offset_db": -6.0}), p.SetMicrophone("m"),
+                p.SetKlangbild({"music": -14.0}), p.SetSoundCategory("s", "music"),
                 p.SetAutostart(True),
                 p.Rescan(), p.RunSignalCheck(), p.CheckForUpdates(), p.InstallUpdate(),
                 p.RegenerateViewToken(),
                 p.CompleteOnboarding(), p.SetOnboardingActive(False),
                 p.SuspendHotkeys(), p.ResumeHotkeys(),
                 p.RequestAddSound(), p.RequestImportPack(),
-                p.RequestExportSounds(None), p.RequestSetSoundIcon("s")):
+                p.RequestExportSounds(None), p.RequestSetSoundIcon("s"),
+                p.LoadWaveform("s"), p.PreviewTrim("s", 0.0, 1.0), p.SetSoundTrim("s", 0.0, 1.0),
+                p.ClearSoundTrim("s"), p.RequestExportTrimmed("s"),):
         # Die Spotify-Lesebefehle stehen bewusst NICHT hier: die Ansicht darf sie.
         assert not a.may_send(access.ROLE_VIEW, cmd), cmd
     assert not a.may_send("quatsch", p.Play("s"))
@@ -181,6 +184,28 @@ def test_the_view_token_survives_a_write_and_read_of_the_config():
     print("Ansichtsschluessel ueberlebt config.json: OK")
 
 
+def test_the_view_may_load_more_library_and_recent_but_not_save_tracks():
+    """F3 Task 1: mehr Bibliothek und Zuletzt gespielt sind Lesen (MUSIC, wie Suchen und
+    Ansehen); ein Titel als gespeichert markieren ist Konto-Sache (MUSIC_ACCOUNT, nur
+    das Fenster) - ein Lesezeichen im Overlay soll die Bibliothek des Kontos nicht aendern."""
+    a = build()
+    for cmd in (p.SpotifyLoadLibraryMore("playlists", 20), p.SpotifyLoadRecent()):
+        assert a.may_send(access.ROLE_VIEW, cmd), cmd
+    for cls in (p.SpotifyLoadLibraryMore, p.SpotifyLoadRecent):
+        assert access.COMMAND_CAPABILITY[cls] == access.MUSIC, cls
+    assert not a.may_send(access.ROLE_VIEW, p.SpotifySetSaved("spotify:track:t1", True))
+    assert access.COMMAND_CAPABILITY[p.SpotifySetSaved] == access.MUSIC_ACCOUNT
+    assert a.may_send(access.ROLE_WINDOW, p.SpotifySetSaved("spotify:track:t1", True))
+    print("mehr laden und zuletzt gespielt sind Lesen, gespeichert ist Kontosache: OK")
+
+
+def test_klangbild_commands_have_their_capabilities():
+    """Kategorie umstellen ist Bibliothek (wie die Lautstaerke), Ziele sind Mischpult."""
+    assert access.COMMAND_CAPABILITY[p.SetSoundCategory] == access.LIBRARY
+    assert access.COMMAND_CAPABILITY[p.SetKlangbild] == access.SETTINGS
+    print("Klangbild-Befehle haben ihre Faehigkeiten: OK")
+
+
 def main():
     test_every_command_has_a_capability()
     test_unknown_capability_names_are_refused()
@@ -191,9 +216,11 @@ def main():
     test_the_view_may_browse_music()
     test_the_view_may_drive_spotify_playback()
     test_the_view_may_not_touch_the_music_account()
+    test_the_view_may_load_more_library_and_recent_but_not_save_tracks()
     test_the_window_may_send_everything()
     test_the_view_token_survives_a_restart_and_can_be_rotated()
     test_the_view_token_survives_a_write_and_read_of_the_config()
+    test_klangbild_commands_have_their_capabilities()
     print("\nALL ACCESS CHECKS PASSED")
 
 

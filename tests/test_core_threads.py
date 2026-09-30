@@ -46,9 +46,10 @@ class TimedEngine(core_fakes.FakeEngine):
         super().__init__()
         self.play_times: list[float] = []
 
-    def play(self, sound_id, volume=1.0):
-        super().play(sound_id, volume)
+    def play(self, sound_id, volume=1.0, monitor_only=False, music=False):
+        started = super().play(sound_id, volume, monitor_only, music)
         self.play_times.append(time.monotonic())
+        return started
 
 
 def wait_until(predicate, timeout=5.0):

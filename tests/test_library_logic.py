@@ -195,7 +195,7 @@ def test_loudness_backfill_retries_only_transient_failures():
     sound = c.library.sounds[0]
     sound.pop("loudness")
     original = library.loudness.measure_dict
-    library.loudness.measure_dict = lambda _path: None
+    library.loudness.measure_dict = lambda _path, _trim=None: None
     try:
         c.library.start_loudness_backfill()
     finally:
@@ -205,7 +205,7 @@ def test_loudness_backfill_retries_only_transient_failures():
     c.library.start_loudness_backfill()
     assert "integrated" in sound["loudness"]
 
-    def explode(_path):
+    def explode(_path, _trim=None):
         raise RuntimeError("ffmpeg crashed")
 
     sound.pop("loudness")
@@ -216,6 +216,148 @@ def test_loudness_backfill_retries_only_transient_failures():
         library.loudness.measure_dict = original
     assert sound["loudness"] == {"failed": True}
     print("backfill: transient failures retry later, crashes mark the sound: OK")
+
+
+def test_set_sound_category_switches_by_hand():
+    """Klangbild K2: umstellen im Kontextmenue, sofort gespeichert; nur zwei Kategorien."""
+    c, events = setup()
+    c.send(p.AddSound(str(FIX / "test_tone.mp3"), "Kategorie"))
+    sound = c.library.sounds[-1]
+    c.send(p.SetSoundCategory(sound["id"], "music"))
+    assert sound["category"] == "music"
+    assert config.find_sound(on_disk(), sound["id"])["category"] == "music", "sofort gespeichert"
+    c.send(p.SetSoundCategory(sound["id"], "voice"))
+    assert sound["category"] == "music", "unbekannte Kategorie wird ignoriert"
+    c.send(p.SetSoundCategory("gibt-es-nicht", "effect"))  # darf nicht werfen
+    print("SetSoundCategory stellt von Hand um: OK")
+
+
+def test_add_measures_the_length_and_sorts_long_sounds_into_music():
+    """Klangbild K2: Laenge beim Hinzufuegen, >= 30 s = Musik; kurz = Effekt."""
+    c, events = setup()
+    c.send(p.AddSound(str(FIX / "test_tone.mp3"), "Kurz"))
+    short = c.library.sounds[-1]
+    assert short["category"] == "effect" and abs(short["duration"] - 2.0) < 0.15, short
+    original = library.loudness.measure_dict
+    library.loudness.measure_dict = lambda _p: {"integrated": -9.0, "max_short": -7.0,
+                                                "peak": -0.5, "duration": 184.2}
+    try:
+        c.send(p.AddSound(str(FIX / "test_tone.mp3"), "Lang"))
+    finally:
+        library.loudness.measure_dict = original
+    song = c.library.sounds[-1]
+    assert song["category"] == "music" and song["duration"] == 184.2, song
+    assert song["loudness"] == {"integrated": -9.0, "max_short": -7.0, "peak": -0.5}, \
+        "die Laenge steht am Sound, nicht in der Messung"
+    assert c.state()["sounds"][-1]["category"] == "music", "die Seite sieht die Kategorie"
+    assert not any("Musik" in text for text, _ in notices(events)), "kein K7-Hinweis beim Hinzufuegen"
+    print("add measures the length and sorts long sounds into music: OK")
+
+
+def test_old_sounds_are_sorted_by_length_once_with_a_hint():
+    """Klangbild K7: alte Sounds (ohne Laenge) werden einmal nachgemessen und nach Laenge
+    eingeordnet; eine Hand-Wahl bleibt; der Hinweis nennt die Zahl."""
+    c, events = setup()
+    for name in ("Lied", "Hand"):
+        c.send(p.AddSound(str(FIX / "test_tone.mp3"), name))
+    song, manual = c.library.sounds[-2], c.library.sounds[-1]
+    for sound in (song, manual):  # so sah ein Sound vor Klangbild aus
+        sound.pop("duration", None)
+        sound.pop("category", None)
+    manual["category"] = "effect"  # von Hand gesetzt
+    calls = []
+    original = library.loudness.measure_dict
+
+    def long_song(path, trim=None):
+        calls.append(path)
+        return {"integrated": -9.0, "max_short": -7.0, "peak": -0.5, "duration": 200.0}
+
+    library.loudness.measure_dict = long_song
+    try:
+        c.library.start_loudness_backfill()
+        assert len(calls) == 2, "beide ohne Laenge werden nachgemessen"
+        c.library.start_loudness_backfill()
+        assert len(calls) == 2, "danach nie wieder"
+    finally:
+        library.loudness.measure_dict = original
+    assert song["category"] == "music" and song["duration"] == 200.0, song
+    assert manual["category"] == "effect", "die Hand-Wahl bleibt"
+    assert manual["duration"] == 200.0
+    assert ("1 langer Sound zählt jetzt als Musik.", "info") in notices(events), notices(events)
+    print("old sounds are sorted by length once, with a hint: OK")
+
+
+def test_failed_remeasurement_keeps_good_loudness():
+    """Review-Fix 1: eine fehlgeschlagene Nachmessung (K7-Backfill trifft einen Sound mit
+    schon gueltiger Lautheit) darf die vorhandenen guten Daten und die Kategorie nicht
+    zerstoeren."""
+    c, events = setup()
+    c.send(p.AddSound(str(FIX / "test_tone.mp3"), "Gut"))
+    sound = c.library.sounds[-1]
+    good_loudness = dict(sound["loudness"])
+    sound["category"] = "music"  # z.B. von Hand gewaehlt oder schon eingeordnet
+    assert library.apply_measurement(sound, {"failed": True}) is False
+    assert sound["loudness"] == good_loudness, sound["loudness"]
+    assert sound["category"] == "music", sound["category"]
+    print("a failed re-measurement keeps the good loudness and category: OK")
+
+
+def test_measurement_without_duration_is_measured_once():
+    """Review-Fix 2 (minor): ein Clip ohne Framezeilen (keine Laenge) bekommt trotzdem
+    den Schluessel "duration" (Wert None) gesetzt, damit needs_measuring nicht bei
+    jedem Start wieder zuschlaegt."""
+    c, events = setup()
+    c.send(p.AddSound(str(FIX / "test_tone.mp3"), "Kurzclip"))
+    sound = c.library.sounds[-1]
+    sound.pop("duration", None)
+    sound.pop("category", None)
+    made_music = library.apply_measurement(
+        sound, {"integrated": -9.0, "max_short": -7.0, "peak": -0.5})
+    assert made_music is False
+    assert "duration" in sound and sound["duration"] is None, sound
+    assert "category" not in sound, "unbekannte Laenge setzt keine Kategorie"
+    assert library.needs_measuring(sound) is False, "einmal ohne Laenge gemessen reicht"
+    print("a measurement without a length is stored once, not remeasured forever: OK")
+
+
+def test_apply_trim_measurement_never_nests_duration_in_loudness():
+    """F2: measure_dict(path, trim) can now carry "duration" when the stored trim was
+    broken (falls back to the whole file - see loudness.measure_dict). That "duration"
+    must never land nested inside sound["loudness"] - apply_trim_measurement pops it,
+    exactly like apply_measurement does for its own "duration" key."""
+    c, events = setup()
+    c.send(p.AddSound(str(FIX / "test_tone.mp3"), "Kaputt"))
+    sound = c.library.sounds[-1]
+    measured = {"integrated": -20.0, "max_short": -18.0, "peak": -3.0, "duration": 99.0}
+    library.apply_trim_measurement(sound, measured)
+    assert sound["loudness"] == {"integrated": -20.0, "max_short": -18.0, "peak": -3.0}, sound["loudness"]
+    print("apply_trim_measurement speichert keine verschachtelte Laenge in loudness: OK")
+
+
+def test_a_trim_remeasure_keeps_the_stored_duration_and_category():
+    """C8/Klangbild-Schnittstelle: loudness.measure_dict(path, trim) liefert nie
+    "duration" (der Schnitt ist nicht die volle Laenge des Sounds). Der Nachmess-Lauf
+    darf die schon gespeicherte volle Laenge und die davon abgeleitete Kategorie
+    deshalb nicht mit None ueberschreiben, wenn er einen getrimmten Sound trifft."""
+    c, events = setup()
+    c.send(p.AddSound(str(FIX / "test_tone.mp3"), "Geschnitten"))
+    sound = c.library.sounds[-1]
+    sound["duration"] = 42.0
+    sound["category"] = "music"
+    sound["trim"] = {"start": 0.5, "end": 1.5}
+    sound.pop("loudness")
+    original = library.loudness.measure_dict
+    library.loudness.measure_dict = lambda _path, _trim=None: {
+        "integrated": -18.0, "max_short": -16.0, "peak": -3.0}
+    try:
+        c.library.start_loudness_backfill()
+    finally:
+        library.loudness.measure_dict = original
+    assert sound["loudness"]["integrated"] == -18.0, sound["loudness"]
+    assert "duration" not in sound["loudness"]
+    assert sound["duration"] == 42.0, "die volle Laenge bleibt unberuehrt"
+    assert sound["category"] == "music", "die Kategorie bleibt unberuehrt"
+    print("ein Nachmessen mit Zuschnitt laesst Laenge und Kategorie unberuehrt: OK")
 
 
 def main():
@@ -229,6 +371,13 @@ def main():
     test_delete_removes_everything()
     test_export_and_import_roundtrip()
     test_loudness_backfill_retries_only_transient_failures()
+    test_set_sound_category_switches_by_hand()
+    test_add_measures_the_length_and_sorts_long_sounds_into_music()
+    test_old_sounds_are_sorted_by_length_once_with_a_hint()
+    test_failed_remeasurement_keeps_good_loudness()
+    test_measurement_without_duration_is_measured_once()
+    test_apply_trim_measurement_never_nests_duration_in_loudness()
+    test_a_trim_remeasure_keeps_the_stored_duration_and_category()
     print("\nALL LIBRARY LOGIC CHECKS PASSED")
 
 

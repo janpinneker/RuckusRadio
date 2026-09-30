@@ -13,6 +13,10 @@ os.environ["RUCKUS_DATA_DIR"] = _TMP  # never touch the real %APPDATA%\Soundboar
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import tk_quiet  # noqa: E402
+
+tk_quiet.install()  # no test window may show up or take focus
+
 from soundboard import config, devices, gui, onboarding, protocol as p  # noqa: E402
 from soundboard.onboarding import (  # noqa: E402
     STEP_COUNT,

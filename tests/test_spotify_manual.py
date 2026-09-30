@@ -1,6 +1,9 @@
 r"""Manueller Ende-zu-Ende-Test der Spotify-Anmeldung - echter Browser, echtes Spotify.
 
-    venv\Scripts\python.exe tests\test_spotify_manual.py [--fresh-login] [--player]
+    venv\Scripts\python.exe tests\test_spotify_manual.py [--fresh-login] [--player] [--f3]
+
+**``--f3``** prueft die neuen Scopes, "Zuletzt gespielt", Alben (auch ``/albums/{id}/tracks``,
+E5-Folgefrage) und schaltet "Gefaellt mir" eines Titels einmal um und zurueck. Nur mit Jan.
 
 **Warum ``--player`` existiert.** Prueft F2 - die Fernbedienung des echten Spotify-
 Players (``/me/player*``) - mit echten Befehlen: Geraete lesen, aktueller Titel, ein
@@ -536,6 +539,86 @@ def probe_player(api) -> bool:
     return ok
 
 
+def probe_f3(api) -> bool:
+    """``--f3``: Scopes, "Zuletzt gespielt", Alben und "Gefaellt mir" am echten Konto.
+
+    "Gefaellt mir" schaltet den Stand eines Titels um und stellt sofort wieder her, was es
+    vorfand. Rueckgabe True nur, wenn alle Schritte liefen.
+    """
+    from soundboard import spotify_player as sp
+
+    print()
+    print("=" * 78)
+    print("F3 (--f3): Scopes, Zuletzt gespielt, Alben, Gefaellt mir")
+    print("=" * 78)
+    ok = True
+
+    # 1) Scopes des gespeicherten Tokens (nur Namen, nie der Token)
+    stored = api._tokens.load() or {}
+    missing = spotify.missing_scopes(stored.get("scope") or "")
+    if missing:
+        print(f"FEHLER Scopes: es fehlen {', '.join(missing)} - einmal neu verbinden")
+        return False
+    print("OK Scopes: beide neuen Scopes erteilt")
+
+    # 2) Zuletzt gespielt
+    uri = None
+    try:
+        payload = api.get("/me/player/recently-played", {"limit": 50})
+        items = payload.get("items") or []
+        print(f"                  {len(items)} Eintraege")
+        for entry in items[:3]:
+            t = entry.get("track") or {}
+            print(f"                  {t.get('name')!r}")
+        if items:
+            uri = (items[0].get("track") or {}).get("uri")
+        print("OK Zuletzt gespielt gelesen")
+    except spotify.SpotifyError as exc:
+        print(f"FEHLER Zuletzt gespielt: {exc.text}  [Detail: {exc.detail or '-'}]")
+        ok = False
+
+    # 3) Alben + E5-Folgefrage: liefert /albums/{id}/tracks Inhalt?
+    try:
+        payload = api.get("/me/albums", {"limit": 5})
+        albums = [(e.get("album") or {}) for e in payload.get("items") or []]
+        print(f"                  {len(albums)} gespeicherte Alben (erste Seite)")
+        if albums and albums[0].get("id"):
+            tracks = api.get(f"/albums/{albums[0]['id']}/tracks", {"limit": 5})
+            print(f"                  /albums/{{id}}/tracks: {len(tracks.get('items') or [])} Titel "
+                  f"fuer {albums[0].get('name')!r}")
+        print("OK Alben gelesen")
+    except spotify.SpotifyError as exc:
+        print(f"FEHLER Alben: {exc.text}  [Detail: {exc.detail or '-'}]")
+        ok = False
+
+    # 4) Gefaellt mir: aktueller Titel, sonst der zuletzt gespielte
+    try:
+        state = sp.map_player(api.get("/me/player"), time.time())
+        if state["track"]:
+            uri = state["track"]["uri"]
+    except spotify.SpotifyError:
+        pass
+    if not uri:
+        print("                  Gefaellt mir uebersprungen - kein Titel gefunden")
+        return ok
+    try:
+        before = bool((api.get("/me/library/contains", {"uris": uri}) or [False])[0])
+        print(f"                  {uri}: vorher {'gespeichert' if before else 'nicht gespeichert'}")
+        api.send("DELETE" if before else "PUT", "/me/library", {"uris": uri})
+        flipped = bool((api.get("/me/library/contains", {"uris": uri}) or [False])[0])
+        api.send("PUT" if before else "DELETE", "/me/library", {"uris": uri})
+        after = bool((api.get("/me/library/contains", {"uris": uri}) or [False])[0])
+        if flipped == before or after != before:
+            print(f"FEHLER Gefaellt mir: umgeschaltet={flipped}, zurueck={after}, vorher={before}")
+            ok = False
+        else:
+            print("OK Gefaellt mir umgeschaltet und zurueckgesetzt")
+    except spotify.SpotifyError as exc:
+        print(f"FEHLER Gefaellt mir: {exc.text}  [Detail: {exc.detail or '-'}]")
+        ok = False
+    return ok
+
+
 def main() -> int:
     # Spotify's own reason ("invalid_client", "redirect_uri mismatch") is logged, not
     # shown in the interface - so show the log here.
@@ -578,6 +661,14 @@ def main() -> int:
             print("Spieler (--player): uebersprungen - kein gespeicherter Spotify-Login "
                   "in der Temp-Kopie.")
         elif not probe_player(api):
+            exit_code = 1
+
+    if "--f3" in sys.argv[1:]:
+        api = build_player_api(client_id)
+        if api is None:
+            print()
+            print("F3 (--f3): uebersprungen - kein gespeicherter Spotify-Login in der Temp-Kopie.")
+        elif not probe_f3(api):
             exit_code = 1
 
     return exit_code

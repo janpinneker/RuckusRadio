@@ -57,7 +57,7 @@ def wire(dialogs):
 
 def test_the_requests_carry_no_path():
     for cls in (p.RequestAddSound, p.RequestImportPack, p.RequestExportSounds,
-                p.RequestSetSoundIcon):
+                p.RequestSetSoundIcon, p.RequestExportTrimmed):
         fields = {f.name for f in dataclasses.fields(cls)}
         assert "path" not in fields, (cls.__name__, fields)
     assert {f.name for f in dataclasses.fields(p.RequestSetSoundIcon)} == {"sound_id"}
@@ -101,7 +101,8 @@ def test_an_export_asks_for_the_target_and_uses_the_existing_flow():
 def test_the_requests_need_the_library_capability():
     for cls, args in ((p.RequestAddSound, {}), (p.RequestImportPack, {}),
                       (p.RequestExportSounds, {"sound_id": None}),
-                      (p.RequestSetSoundIcon, {"sound_id": "s1"})):
+                      (p.RequestSetSoundIcon, {"sound_id": "s1"}),
+                      (p.RequestExportTrimmed, {"sound_id": "s1"})):
         assert access.COMMAND_CAPABILITY[cls] == access.LIBRARY, cls
         assert not access.ROLE_CAPABILITIES[access.ROLE_VIEW] & {access.LIBRARY}
     print("die Requests brauchen LIBRARY, die Ansicht hat sie nicht: OK")

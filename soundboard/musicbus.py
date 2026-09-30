@@ -1,5 +1,7 @@
-"""Musik-Bus: der Ton anderer Apps (Spotify, Browser) wird per WASAPI-Loopback
-mitgeschnitten und in den Mixer gegeben, damit Discord/CS ihn hoeren.
+"""Musik-Bus: der Ton **von Spotify** wird per Process-Loopback (`processloopback.py`)
+mitgeschnitten und in den Mixer gegeben, damit Discord/CS ihn hoeren; der
+Geraete-Loopback `LoopbackCapture` bleibt als Werkzeug fuer die Handpruefung und
+als Weg ohne `target_finder`.
 
 Kern-Anbindung (Spec "musik-bus-kern", 2026-09-27): `MusicBusService` meldet die
 Befehle `SetMusicBus`/`SetMusicBusGain` am Kern, haelt den State-Teil `musicbus`
@@ -35,11 +37,14 @@ daneben):
   den Kanal-Mask (3 fuer Stereo) statt des Formats, und ein Float-Format wird
   still als Integer gedeutet. Diese Falle kostete schon einen Messlauf; der
   Regressionstest dafuer steht in `tests/test_musicbus_logic.py`.
-- **Der Abgriff haengt an der Endpoint-ID vom Oeffnen.** Wechselt das Windows-
-  Standard-Geraet, ist der Client tot - `MusicBus.rebuild()` baut ihn neu auf
-  (dieselbe Aufgabe, die `defaultdevice.DefaultDeviceWatcher` fuer den
-  Kopfhoerer loest). Exclusive Mode eines anderen Programms ist ungeprueft
-  (F3).
+- **Der Abgriff haengt an der Endpoint-ID vom Oeffnen - nur auf dem Geraete-Weg**
+  (`LoopbackCapture` ohne `target_finder`, das Standard-Wiedergabegeraet). Wechselt
+  dort das Windows-Standardgeraet, ist der Client tot - `MusicBus.rebuild()` baut
+  ihn neu auf (dieselbe Aufgabe, die `defaultdevice.DefaultDeviceWatcher` fuer den
+  Kopfhoerer loest). Der Spotify-Weg (mit `target_finder`) haengt sich im Waechter
+  selbst neu an, sobald sich die gefundene PID aendert (`_follow_target`) - er
+  kennt keine Endpoint-ID und braucht `rebuild()` nicht. Exclusive Mode eines
+  anderen Programms ist ungeprueft (F3).
 """
 
 from __future__ import annotations
@@ -56,11 +61,22 @@ from typing import Callable
 
 import numpy as np
 
-from . import virtualmic
+from . import dynamics, virtualmic
 from .config import clamp_gain
 from .protocol import SetMusicBus, SetMusicBusGain
 
 log = logging.getLogger(__name__)
+
+# Final-Fix F3: nach so vielen aufeinanderfolgenden Fehlschlaegen der Prozesssuche
+# wird der letzte Fehler geworfen (bestehender Weg -> error/on_error -> Notice),
+# statt fuer immer nur zu warten.
+LOOKUP_FAILURES_BEFORE_ERROR = 5
+
+# Review Minor M2: Sentinel fuer den Periodencheck in `_follow_target` - ein
+# verschluckter Fehler der Prozesssuche muss sich von einem ECHTEN Ergebnis (auch
+# einem echten None = "kein Ziel mehr") unterscheiden lassen, sonst wird ein
+# einzelner Aussetzer wie eine echte PID-Aenderung behandelt.
+_LOOKUP_UNCHANGED = object()
 
 # ---------------------------------------------------------------------------
 # COM-Grundlagen (dieselbe minimale Bauart wie soundboard/defaultdevice.py
@@ -212,7 +228,7 @@ def read_waveformat(buf: bytes) -> AudioFormat:
     if tag == WAVE_FORMAT_EXTENSIBLE:
         # Data1 des Subformat-GUID: 1 = PCM, 3 = IEEE float
         is_float = struct.unpack_from("<I", buf, _OFF_SUBFORMAT)[0] == WAVE_FORMAT_IEEE_FLOAT
-    elif tag != WAVE_FORMAT_PCM:
+    elif tag not in (WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT):
         raise ValueError(f"unexpected wave format tag 0x{tag:04x}")
     return AudioFormat(rate, channels, bits, is_float, align)
 
@@ -359,13 +375,36 @@ class MusicBus:
                  target_rate: int = virtualmic.TARGET_SAMPLERATE,
                  max_blocks: int = 50,
                  buffer_ms: int = 100,
-                 capture_factory: Callable[[], LoopbackCapture] = LoopbackCapture):
+                 capture_factory: Callable[..., LoopbackCapture] = LoopbackCapture,
+                 target_finder: Callable[[], int | None] | None = None,
+                 poll_s: float = 2.0,
+                 stop_timeout_s: float = 2.0,
+                 autolevel: bool = False):
         self._gain = float(gain)
+        # Auto-Pegel (Jan 2026-09-30): levels the captured music before the gain, so the
+        # Spotify slider only sets his own ears. Off for a plain bus (exact tests, probes).
+        self.leveler: dynamics.MusicLeveler | None = dynamics.MusicLeveler(samplerate=target_rate) if autolevel else None
         self._block_frames = block_frames
         self._target_rate = target_rate
         self._max_blocks = max_blocks
         self._capture_factory = capture_factory
         self._buffer_ms = buffer_ms
+        # Spotify-Waechter (Spec "audio-routing-spotify" §3): mit target_finder
+        # folgt der Bus einem Prozess - `capture_factory(pid)` statt `capture_factory()`.
+        self._target_finder = target_finder
+        self._poll_s = poll_s
+        # Review Minor M3: join-Timeout in stop() einstellbar (Test: ein haengender
+        # Faden mit einem kurzen Timeout, statt 2s abzuwarten).
+        self._stop_timeout_s = stop_timeout_s
+        # Faden, der beim letzten stop() nach dem join-Timeout noch lebte (z. B. haengt
+        # noch in einem langsamen open()) - start() darf daneben keinen zweiten Faden
+        # aufmachen, der sich _capture mit ihm teilt.
+        self._stale_thread: threading.Thread | None = None
+        self.waiting = False  # an, aber kein Zielprozess (Spotify laeuft nicht)
+        # Final-Fix F3: Zaehler aufeinanderfolgender Fehlschlaege der Prozesssuche
+        # selbst (nicht "kein Spotify gefunden" - das ist kein Fehler). Ein Erfolg
+        # setzt ihn zurueck.
+        self._lookup_failures = 0
         self._ring: deque[np.ndarray] = deque()
         self._partial: np.ndarray | None = None
         self._lock = threading.Lock()
@@ -377,6 +416,10 @@ class MusicBus:
         # Gerufen aus dem Abgriff-Faden, wenn er mit einem Fehler endet - der
         # Service meldet das als Notice, "nie still sterben" (Spec §2).
         self.on_error: Callable[[BaseException], None] | None = None
+        # Gerufen aus dem Abgriff-Faden, wenn sich `waiting` aendert (Review Fix 1,
+        # 2026-09-29): der Service stoesst darueber ein StateChanged an, sonst
+        # erfaehrt die Oberflaeche vom Warten erst beim naechsten Zufalls-Update.
+        self.on_state: Callable[[], None] | None = None
         # Mischpfad (Spec §4): jeder normalisierte Block geht zusätzlich zum
         # Ringpuffer hier raus - `sinkgroup.SinkGroup.distribute_music`.
         self.on_block: Callable[[np.ndarray], None] | None = None
@@ -395,18 +438,48 @@ class MusicBus:
         self._gain = float(gain)
 
     def start(self) -> None:
+        # Review Minor M3: ein Faden, der nach dem letzten stop() noch haengt (z. B.
+        # in einem langsamen open()), darf keinen zweiten Faden neben sich bekommen,
+        # der sich _capture teilt - stattdessen ein Fehler statt eines stillen
+        # zweiten Fadens. Vor der running-Pruefung, sonst wuerde running (das denselben
+        # Faden sieht) den Fall schon vorher wortlos abfangen.
+        if self._stale_thread is not None and self._stale_thread.is_alive():
+            self.error = RuntimeError(
+                "Musik-Bus hängt noch beim Beenden – bitte gleich noch einmal einschalten.")
+            hook = self.on_error
+            if hook is not None:
+                try:
+                    hook(self.error)
+                except Exception:
+                    log.exception("musicbus on_error hook failed")
+            return
+        self._stale_thread = None
         if self.running:
             return
         self._stop.clear()
         self.error = None
+        # Review Minor M1: ein Abbruch durch 5 Fehler in Folge darf beim naechsten
+        # Einschalten nicht nachwirken - sonst wuerde ein einzelner Fehler den Bus
+        # sofort wieder beenden, statt erst nach 5 in Folge.
+        self._lookup_failures = 0
+        # Mit target_finder faengt der Bus im Warten an (Review Fix 4): sonst zeigt
+        # der Zustand kurz "running", bevor ueberhaupt etwas anhaengt.
+        self._set_waiting(self._target_finder is not None)
         self._thread = threading.Thread(target=self._run, name="ruckus-musicbus", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        thread, self._thread = self._thread, None
+        thread = self._thread
         if thread is not None:
-            thread.join(timeout=2.0)
+            thread.join(timeout=self._stop_timeout_s)
+            if thread.is_alive():
+                # Review Minor M3: der Faden haengt noch (z. B. langsames open()) -
+                # den Verweis behalten (running bleibt wahr), statt ihn wie beendet zu
+                # behandeln; start() prueft _stale_thread, bevor es einen neuen aufmacht.
+                self._stale_thread = thread
+            else:
+                self._thread = None
 
     def close(self) -> None:
         self.stop()
@@ -414,7 +487,10 @@ class MusicBus:
 
     def rebuild(self) -> None:
         """Nach einem Standard-Geraetewechsel: der Abgriff haengt an der
-        Endpoint-ID vom Oeffnen, also neu aufbauen (Modul-Doku)."""
+        Endpoint-ID vom Oeffnen, also neu aufbauen (Modul-Doku). Nur fuer den
+        Geraete-Weg (ohne `target_finder`) - der Spotify-Weg haengt sich in
+        `_follow_target` selbst neu an. Final-Fix F5: derzeit ohne Aufrufer
+        (kein Geraete-Watcher fuer den Musik-Bus verdrahtet)."""
         was_running = self.running
         self.stop()
         if was_running:
@@ -428,14 +504,13 @@ class MusicBus:
         except OSError:
             pass  # ohne COM laeuft nichts; der Fehler unten sichtbar machen
         try:
-            self._capture = self._capture_factory()
-            if hasattr(self._capture, "buffer_ms"):
-                self._capture.buffer_ms = self._buffer_ms
-            self.format = self._capture.open()
-            self._capture.start()
-            while not self._stop.is_set():
-                self._pump_once()
-                time.sleep(0.005)
+            if self._target_finder is None:
+                self._open_capture(None)
+                while not self._stop.is_set():
+                    self._pump_once()
+                    time.sleep(0.005)
+            else:
+                self._follow_target()
         except BaseException as exc:  # noqa: BLE001 - der Thread darf nicht still sterben
             self.error = exc
             hook = self.on_error
@@ -445,12 +520,109 @@ class MusicBus:
                 except Exception:
                     log.exception("musicbus on_error hook failed")
         finally:
-            capture, self._capture = self._capture, None
-            if capture is not None:
-                try:
-                    capture.close()
-                except OSError:
-                    pass
+            self._set_waiting(False)
+            self._close_capture()
+
+    def _set_waiting(self, value: bool) -> None:
+        """`waiting` nur bei einer echten Aenderung melden (Review Fix 3): der
+        Service haengt hier `on_state` ein und stoesst ein StateChanged an - das
+        soll beim Ein-/Aussteigen passieren, nicht bei jedem Prueftakt."""
+        if self.waiting == value:
+            return
+        self.waiting = value
+        hook = self.on_state
+        if hook is not None:
+            try:
+                hook()
+            except Exception:
+                log.exception("musicbus on_state hook failed")
+
+    def _find_target(self, on_failure: int | None = None) -> int | None:
+        """`target_finder` gekapselt (Review Fix 2): eine Toolhelp-Stoerung darf den
+        Bus nie beenden - sie wird wie "kein Ziel" behandelt (waiting/detach).
+
+        Final-Fix F3: eine DAUERHAFT scheiternde Suche loggte bisher bei jedem
+        einzelnen Prueftakt einen vollen Traceback und hing sonst fuer immer im
+        Warten. Jetzt nur der erste Fehler einer Serie mit Traceback, jeder weitere
+        nur noch als kurze Zeile - und nach `LOOKUP_FAILURES_BEFORE_ERROR` Fehlern in
+        Folge wird der letzte Fehler geworfen (bestehender Weg: `_run` faengt ihn,
+        setzt `self.error`, ruft `on_error` -> Notice). Ein Erfolg setzt den Zaehler
+        zurueck - auch wenn er "kein Ziel gefunden" bedeutet (das ist kein Fehler).
+
+        Review Minor M2: `on_failure` ist der Rueckgabewert bei einem verschluckten
+        Fehler (unter der Schwelle) - Standard `None` fuer die bisherigen Aufrufer
+        (Erstsuche, Gnadenfrist), der Periodencheck uebergibt `_LOOKUP_UNCHANGED`,
+        damit er einen Fehler nicht mit einem echten "Ziel weg" verwechselt."""
+        try:
+            result = self._target_finder()
+        except Exception as exc:
+            self._lookup_failures += 1
+            if self._lookup_failures == 1:
+                log.warning("music bus: process lookup failed", exc_info=True)
+            else:
+                log.warning("music bus: process lookup failed again (%d in a row): %s",
+                           self._lookup_failures, exc)
+            if self._lookup_failures >= LOOKUP_FAILURES_BEFORE_ERROR:
+                raise
+            return on_failure
+        self._lookup_failures = 0
+        return result
+
+    def _open_capture(self, pid: int | None) -> None:
+        self._capture = self._capture_factory() if pid is None else self._capture_factory(pid)
+        if hasattr(self._capture, "buffer_ms"):
+            self._capture.buffer_ms = self._buffer_ms
+        self.format = self._capture.open()
+        self._capture.start()
+
+    def _close_capture(self) -> None:
+        capture, self._capture = self._capture, None
+        self.format = None
+        if capture is not None:
+            try:
+                capture.close()
+            except OSError:
+                pass
+
+    def _follow_target(self) -> None:
+        """Warten, anhaengen, bei Ende oder Neustart des Ziels neu anhaengen.
+        Ein Fehler, waehrend das Ziel noch lebt, ist echt und wird geworfen."""
+        while not self._stop.is_set():
+            pid = self._find_target()
+            if pid is None:
+                self._set_waiting(True)
+                self._stop.wait(self._poll_s)
+                continue
+            self._set_waiting(False)
+            try:
+                self._open_capture(pid)
+                next_check = time.monotonic() + self._poll_s
+                while not self._stop.is_set():
+                    self._pump_once()
+                    if time.monotonic() >= next_check:
+                        next_check = time.monotonic() + self._poll_s
+                        # M2: nur eine ERFOLGREICHE Suche mit anderer PID (oder None)
+                        # darf die Aufnahme abbrechen - ein Fehler zaehlt als
+                        # unveraendert (der Fehlerzaehler laeuft trotzdem mit, siehe
+                        # _find_target/F3).
+                        found = self._find_target(on_failure=_LOOKUP_UNCHANGED)
+                        if found is not _LOOKUP_UNCHANGED and found != pid:
+                            break
+                    time.sleep(0.005)
+            except Exception:
+                # Review Fix 1: Spotify kann gerade beim Schliessen sein - der
+                # Finder meldet dieselbe PID noch einen Moment lang. Erst eine
+                # kurze Gnadenfrist abwarten und neu pruefen, bevor der Fehler
+                # als echt gilt und den Faden beendet.
+                still_there = self._find_target() == pid
+                if still_there:
+                    self._stop.wait(min(self._poll_s, 0.5))
+                    still_there = not self._stop.is_set() and self._find_target() == pid
+                if still_there:
+                    raise
+                log.info("music bus: process %s went away while capturing", pid)
+            finally:
+                self._close_capture()
 
     def _pump_once(self) -> None:
         """Ein Lesezyklus: abgreifen, normalisieren, in den Puffer. Trennbar
@@ -467,6 +639,8 @@ class MusicBus:
         block = virtualmic.to_stereo(np.asarray(block, dtype=np.float32))
         if self._capture is not None and self._capture.format is not None:
             block = resample_linear(block, self._capture.format.rate, self._target_rate)
+        if self.leveler is not None:
+            block = self.leveler.process(block)
         if self._gain != 1.0:
             block = block * self._gain
         hook = self.on_block
@@ -502,6 +676,14 @@ class MusicBus:
         return out
 
 
+def spotify_bus(*, gain: float = 1.0) -> MusicBus:
+    """Der Bus, den Ruckus baut: nur der Prozessbaum von Spotify.exe (Spec
+    "audio-routing-spotify" D2/D4). Import hier, weil processloopback musicbus importiert."""
+    from . import processloopback
+    return MusicBus(gain=gain, capture_factory=processloopback.ProcessLoopbackCapture,
+                    target_finder=processloopback.find_spotify_pid, autolevel=True)
+
+
 # ---------------------------------------------------------------------------
 # Kern-Anbindung
 # ---------------------------------------------------------------------------
@@ -522,8 +704,14 @@ class MusicBusService:
     def __init__(self, core, *, factory=None):
         self._core = core
         self._error = ""
-        self.bus = (factory or MusicBus)(gain=clamp_gain(core.store.data.get("musicbus_gain")))
+        self._sink = None  # device thread only (Final-Fix F2): set by attach_sink
+        self.bus = (factory or spotify_bus)(gain=clamp_gain(core.store.data.get("musicbus_gain")))
         self.bus.on_error = self._bus_failed
+        # Review Fix 3: `waiting` soll die Oberflaeche erreichen, sobald es sich
+        # aendert - "volatile" ist DEFAULT_GROUP, `changed` loest darueber ein
+        # StateChanged aus (wie `_report_failure` unten, ueber den Executor, weil
+        # der Aufruf aus dem Abgriff-Faden kommt).
+        self.bus.on_state = lambda: core.executor.submit(core.changed, "volatile")
         core.handle(SetMusicBus, self.set_music_bus)
         core.handle(SetMusicBusGain, self.set_music_bus_gain)
         core.add_state("musicbus", self.snapshot, group="volatile")
@@ -533,12 +721,16 @@ class MusicBusService:
     # ---- Befehle (Kern-Thread) ----
 
     def set_music_bus(self, cmd: SetMusicBus) -> None:
-        self._core.store.data["musicbus_enabled"] = bool(cmd.enabled)
-        if cmd.enabled:
+        enabled = bool(cmd.enabled)
+        self._core.store.data["musicbus_enabled"] = enabled
+        if enabled:
             self._error = ""
             self.bus.start()
         else:
             self.bus.stop()
+        # Final-Fix F2: a music-only cable must open/close with the bus - PortAudio
+        # only on the device thread, never here (the core thread).
+        self._core.devices.submit(self._apply_music_enabled, enabled)
         self._core.store.save_now()
         self._core.changed("volatile")
 
@@ -560,10 +752,17 @@ class MusicBusService:
     def shutdown(self) -> None:
         self.bus.close()
 
-    def attach_sink(self, sink) -> None:
+    def attach_sink(self, sink) -> None:  # device thread
         """Der Mischpfad-Haken: `sink.distribute_music` bekommt jeden Bus-Block
-        (aufrufen aus dem Abgriff-Faden). `sink=None` haengt ab."""
+        (aufrufen aus dem Abgriff-Faden). `sink=None` haengt ab. Merkt sich den Sink
+        (Final-Fix F2), damit `set_music_bus` ihn spaeter ueber `set_music_enabled`
+        erreichen kann - jeder Neuaufbau ersetzt ihn hier wie den on_block-Haken."""
+        self._sink = sink
         self.bus.on_block = getattr(sink, "distribute_music", None) if sink is not None else None
+
+    def _apply_music_enabled(self, on: bool) -> None:  # device thread
+        if self._sink is not None:
+            self._sink.set_music_enabled(on)
 
     # ---- Fehler und Zustand ----
 
@@ -579,9 +778,12 @@ class MusicBusService:
         """Reiner Lesevorgang: kein Netz, keine Datei, kein Geraet."""
         live = getattr(self.bus, "error", None)
         error = (str(live) or type(live).__name__) if live else self._error
+        alive = bool(self.bus.running)
+        waiting = alive and bool(getattr(self.bus, "waiting", False))
         return {
             "enabled": bool(self._core.store.data.get("musicbus_enabled")),
-            "running": bool(self.bus.running),
+            "running": alive and not waiting,
+            "waiting": waiting,
             "error": error,
             "gain": clamp_gain(self._core.store.data.get("musicbus_gain")),
         }

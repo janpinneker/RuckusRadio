@@ -80,12 +80,51 @@ def test_load_config_oserror_keeps_app_startable():
 def test_output_settings_defaults():
     cfg = config._default_config()
     cable = config.output_settings(cfg, "CABLE Output (VB-Audio Virtual Cable)")
-    assert cable == {"mic": True, "mic_gain": 1.0, "sounds": True, "sounds_gain": 1.0}, cable
+    assert cable == {"mic": True, "mic_gain": 1.0, "sounds": True, "sounds_gain": 1.0,
+                     "music": True}, cable
     monitor = config.output_settings(cfg, config.MONITOR_KEY, is_monitor=True)
     assert monitor["mic"] is False and monitor["sounds"] is True, monitor
     # Reading must not write.
     assert cfg["outputs"] == {}, cfg["outputs"]
     print("output_settings defaults: OK")
+
+
+def test_music_is_per_cable_and_never_on_the_headphones():
+    """Spec audio-routing §4: Kabel ohne Schluessel = Musik an (nichts aendert sich
+    still), Kopfhoerer immer aus - auch wenn eine alte/kaputte Config es anders sagt."""
+    cfg = config._default_config()
+    cfg["outputs"] = {"CABLE Output": {"mic": True, "mic_gain": 1.0, "sounds": True,
+                                       "sounds_gain": 1.0},
+                      config.MONITOR_KEY: {"sounds": True, "music": True}}
+    assert config.output_settings(cfg, "CABLE Output")["music"] is True, "alter Eintrag: an"
+    assert config.output_settings(cfg, config.MONITOR_KEY, is_monitor=True)["music"] is False
+    got = config.set_output_settings(cfg, "CABLE Output", music=False)
+    assert got["music"] is False and cfg["outputs"]["CABLE Output"]["music"] is False
+    assert config.set_output_settings(cfg, config.MONITOR_KEY, music=True)["music"] is False, \
+        "Kopfhoerer bleiben ohne Musik"
+    print("music per cable, never on the headphones: OK")
+
+
+def test_music_follows_sounds_when_only_an_old_entry_without_music_is_stored():
+    """Final-Fix F1: ein gespeicherter Eintrag ohne den Schluessel `music` darf die
+    Musik nicht immer auf True stellen - sie folgt `sounds`, sonst schaltet ein
+    Kabel, dessen Sounds abgeschaltet waren, nach dem Update ploetzlich Musik ein."""
+    cfg = config._default_config()
+    cfg["outputs"] = {
+        "CABLE Output": {"mic": True, "mic_gain": 1.0, "sounds": False, "sounds_gain": 1.0},
+        "Hi-Fi Cable Output": {"mic": True, "mic_gain": 1.0, "sounds": True, "sounds_gain": 1.0},
+    }
+    assert config.output_settings(cfg, "CABLE Output")["music"] is False, \
+        "alter Eintrag, sounds False, kein music: music folgt sounds"
+    assert config.output_settings(cfg, "Hi-Fi Cable Output")["music"] is True, \
+        "alter Eintrag, sounds True, kein music: music folgt sounds"
+    # Kein Eintrag ueberhaupt (brandneues Kabel): True, unveraendert.
+    assert config.output_settings(cfg, "Neues Kabel")["music"] is True
+    # Ein gespeicherter Eintrag MIT music gewinnt weiterhin, unabhaengig von sounds.
+    cfg["outputs"]["CABLE Output"]["music"] = True
+    assert config.output_settings(cfg, "CABLE Output")["music"] is True, \
+        "ein gespeichertes music gewinnt ueber die sounds-Ableitung"
+    print("music folgt sounds bei altem Eintrag ohne music: OK")
 
 
 def test_voicemeeter_starts_without_the_mic():
@@ -279,12 +318,31 @@ def test_music_bus_defaults_and_gain_clamping():
     print("music bus defaults and gain clamping: OK")
 
 
+def test_klangbild_defaults_and_old_configs():
+    """Klangbild K3/K4: neue Schluessel mit Standard; alte Configs bekommen sie, ein
+    gespeicherter Teilwert bleibt wie gespeichert (levels.py ergaenzt den Rest)."""
+    fresh = config._default_config()
+    assert fresh["klangbild_targets"] == {"effect": -20.0, "music": -14.0}
+    assert fresh["music_offset_db"] == -3.0
+    merged = config._with_defaults({"version": 2, "sounds": []})
+    assert merged["klangbild_targets"] == {"effect": -20.0, "music": -14.0}
+    assert merged["music_offset_db"] == -3.0
+    kept = config._with_defaults({"version": 2, "sounds": [],
+                                  "klangbild_targets": {"music": -12.0}})
+    assert kept["klangbild_targets"] == {"music": -12.0}
+    fresh["klangbild_targets"]["music"] = -10.0
+    assert config.DEFAULT_CONFIG["klangbild_targets"]["music"] == -14.0, "Standard unberuehrt"
+    print("Klangbild-Schluessel: Standard, alte Config, Teilwerte: OK")
+
+
 def main():
     test_fresh_config_has_outputs()
     test_old_config_keeps_working()
     test_migration_is_idempotent()
     test_load_config_oserror_keeps_app_startable()
     test_output_settings_defaults()
+    test_music_is_per_cable_and_never_on_the_headphones()
+    test_music_follows_sounds_when_only_an_old_entry_without_music_is_stored()
     test_voicemeeter_starts_without_the_mic()
     test_set_output_settings_clamps()
     test_version_2_resets_the_hand_tuned_cable_gains()
@@ -294,6 +352,7 @@ def main():
     test_stop_all_migration_is_one_time_and_skips_a_taken_alt_delete()
     test_stop_all_migration_survives_non_string_hotkeys()
     test_music_bus_defaults_and_gain_clamping()
+    test_klangbild_defaults_and_old_configs()
     print("\nALL CONFIG LOGIC CHECKS PASSED")
 
 

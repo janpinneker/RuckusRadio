@@ -104,14 +104,23 @@ class SpotifyPlayerService:
         self._quiet_until = 0.0
         self._inflight: set[str] = set()     # "seek" / "volume" running
         self._queued: dict[str, object] = {}  # newest waiting command per kind
+        # Task 8 ("Gefällt mir", spec §14.6/R3): the like state lives apart from the poll -
+        # `_saved` is the answer, `_saved_uri` is the uri it belongs to (or the one a check
+        # is in flight for), `_saved_token` supersedes a stale contains answer or an older
+        # SpotifySetSaved (a track change or a click always wins over what came before it).
+        self._saved: dict | None = None      # {"uri", "saved"}
+        self._saved_uri: str | None = None
+        self._saved_token = 0
         for cls, fn in ((p.SpotifyPlay, self.play), (p.SpotifyPause, self.pause),
                         (p.SpotifyResume, self.resume), (p.SpotifyNext, self.next),
                         (p.SpotifyPrevious, self.previous), (p.SpotifySeek, self.seek),
                         (p.SpotifySetVolume, self.set_volume), (p.SpotifySetShuffle, self.set_shuffle),
                         (p.SpotifySetRepeat, self.set_repeat), (p.SpotifyAddToQueue, self.add_to_queue),
-                        (p.SpotifyTransfer, self.transfer), (p.SpotifyLoadDevices, self.load_devices)):
+                        (p.SpotifyTransfer, self.transfer), (p.SpotifyLoadDevices, self.load_devices),
+                        (p.SpotifySetSaved, self.set_saved)):
             core.handle(cls, fn)
         core.add_state("spotify_player", self.snapshot)
+        core.subscribe(self._on_event)
         core.on_start(self._start)
         core.on_shutdown(self._stop)
 
@@ -121,7 +130,11 @@ class SpotifyPlayerService:
         if not self._spotify.connected:
             return None
         base = self._player or map_player({}, 0.0)
-        return {**base, "devices": self._devices, "error": self.error}
+        track = base.get("track")
+        if track is not None:
+            saved = self._saved if self._saved and self._saved["uri"] == track["uri"] else None
+            track = {**track, "is_saved": saved["saved"] if saved else None}
+        return {**base, "track": track, "devices": self._devices, "error": self.error}
 
     def attach_viewers(self, fn: Callable[[], int]) -> None:
         self._viewers = fn
@@ -184,6 +197,24 @@ class SpotifyPlayerService:
             api.send("PUT", "/me/player", None, {"device_ids": [device_id], "play": bool(cmd.play)})
             return device_id
         self._run(call)
+
+    def set_saved(self, cmd) -> None:
+        """`SpotifySetSaved` (spec §14.6/R3): optimistic, `PUT`/`DELETE /me/library` with
+        `uris`, reverted on failure. No call at all while `_needs_reconnect` stands (spec
+        §14.1/E1) - the heart is hidden then anyway, but a stray command must not call out."""
+        if not self._ready():
+            return
+        if self._spotify._needs_reconnect():
+            return
+        uri = cmd.uri
+        saved = bool(cmd.saved)
+        previous = self._saved.get("saved") if self._saved and self._saved.get("uri") == uri else None
+        self._saved_token += 1   # supersedes any contains answer still out for this uri
+        token = self._saved_token
+        self._saved_uri = uri
+        self._saved = {"uri": uri, "saved": saved}
+        self._core.state_changed()
+        self._core.workers.submit(self._work_set_saved, uri, saved, previous, token)
 
     def load_devices(self, _cmd=None) -> None:
         if not self._ready():
@@ -286,6 +317,86 @@ class SpotifyPlayerService:
         if queued is not None and not drop_queued:
             {"seek": self.seek, "volume": self.set_volume}[kind](queued)
 
+    # ---- "Gefällt mir" (Task 8, spec §14.6/R3) ----
+
+    def _on_event(self, event) -> None:  # core
+        # A logout ends the account the like answer belongs to - a login (maybe another
+        # account) inside one poll interval must ask again (final review Minor 7).
+        if isinstance(event, p.SpotifyAuthChanged) and not event.connected:
+            self._saved = None
+            self._saved_uri = None
+            self._saved_token += 1  # a click or check still out belongs to the old account
+
+    def _work_set_saved(self, uri: str, saved: bool, previous, token: int) -> None:  # worker
+        api = self._spotify.api
+        method = "PUT" if saved else "DELETE"
+        try:
+            # the uris go in the query string: a JSON body gets 400 "Missing required
+            # field: uris" (live 2026-09-29)
+            api.send(method, "/me/library", {"uris": uri})
+        except SpotifyError as exc:
+            self._core.executor.submit(self._set_saved_failed, uri, previous, token, exc)
+            return
+        except Exception as exc:  # noqa: BLE001 - never leave the click unresolved
+            log.exception("spotify set-saved failed unexpectedly")
+            self._core.executor.submit(self._set_saved_failed, uri, previous, token,
+                                       NetworkError(detail=str(exc)))
+            return
+        self._core.executor.submit(self._set_saved_done, token)
+
+    def _set_saved_done(self, token: int) -> None:  # core
+        if token != self._saved_token:
+            return  # superseded meanwhile - nothing left to confirm
+        self._clear_error()
+        self._core.state_changed()
+
+    def _set_saved_failed(self, uri: str, previous, token: int, error: SpotifyError) -> None:  # core
+        if token == self._saved_token and self._saved and self._saved.get("uri") == uri:
+            self._saved = {"uri": uri, "saved": previous} if previous is not None else None
+        if self._handled_auth_or_rate_limit(error, from_fetch=False):
+            return  # 401 drops the login, 429 waits for Retry-After - like any command
+        self._set_error(error)   # same reporting as any other player command failure
+
+    def _maybe_check_saved(self) -> None:  # core, called once a fresh player state is in
+        track = self._player.get("track") if self._player else None
+        uri = track.get("uri") if track else ""
+        if not uri or self._saved_uri == uri:
+            return  # nothing playing, or already asked/known for this track (a poll keeps it)
+        if self._spotify._needs_reconnect():
+            return  # no scope -> no call at all (spec §14.1/E1); is_saved stays null
+        self._saved_uri = uri
+        self._saved_token += 1
+        token = self._saved_token
+        self._core.workers.submit(self._work_check_saved, uri, token)
+
+    def _work_check_saved(self, uri: str, token: int) -> None:  # worker
+        api = self._spotify.api
+        try:
+            result = api.get("/me/library/contains", {"uris": uri})
+        except SpotifyError as exc:
+            self._core.executor.submit(self._check_saved_failed, uri, token, exc)
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.exception("spotify saved-check failed unexpectedly")
+            self._core.executor.submit(self._check_saved_failed, uri, token, NetworkError(detail=str(exc)))
+            return
+        self._core.executor.submit(self._checked_saved, uri, token, result)
+
+    def _checked_saved(self, uri: str, token: int, result) -> None:  # core
+        if token != self._saved_token or self._saved_uri != uri:
+            return  # a track change or a click superseded this - the late answer is discarded
+        saved = bool(result[0]) if isinstance(result, list) and result else False
+        self._saved = {"uri": uri, "saved": saved}
+        self._core.state_changed()
+
+    def _check_saved_failed(self, uri: str, token: int, error: SpotifyError) -> None:  # core
+        if token != self._saved_token or self._saved_uri != uri:
+            return  # superseded already; nothing to retry
+        if error.detail:
+            log.info("spotify saved-check: %s", error.detail)
+        self._saved_uri = None  # unresolved - a later poll of the same track tries again
+        self._handled_auth_or_rate_limit(error, from_fetch=False)  # 401/429 as everywhere
+
     @property
     def _remembered(self) -> str:
         return str(self._core.store.data.get("spotify_device_id") or "")
@@ -345,6 +456,7 @@ class SpotifyPlayerService:
         self._player = map_player(payload, self._clock())
         if self._error_from_fetch:
             self._clear_error()
+        self._maybe_check_saved()
         self._core.state_changed()
         self._schedule(next_poll_delay(self._player["is_playing"]))
 
@@ -372,6 +484,8 @@ class SpotifyPlayerService:
             self._error_from_fetch = False
             self._last_notice = None
             self._quiet_until = 0.0
+            self._saved = None
+            self._saved_uri = None
             self._schedule(POLL_IDLE)
             return
         now = self._clock()

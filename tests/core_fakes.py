@@ -36,15 +36,31 @@ class FakeEngine:
         self.voicemeeter_device = None
         self.monitor_device = None
         self.monitor_volume = 0.5
+        self.music_plays: list[str] = []  # Klangbild: plays marked as music
+        self.trims: dict[str, object] = {}  # sound id -> trim of its last preload
+        self.clips: list[tuple[str, int, float]] = []  # trim previews: (id, frames, gain)
+        self.no_target = False  # K6: no headphone, no mixer - play_clip must start nothing
 
     def _record(self, call: str) -> None:
         self.threads.append((call, threading.current_thread().name))
 
-    def preload(self, sound_id, path):
+    def preload(self, sound_id, path, trim=None):
         self.preloads.append(sound_id)
+        self.trims[sound_id] = trim
         if not Path(path).exists():
             raise FileNotFoundError(path)
         self.loaded.add(sound_id)
+
+    def play_clip(self, sound_id, samples, volume=1.0):
+        self._record("play_clip")
+        if self.fail_play:
+            self.fail_play = False
+            raise RuntimeError("fake device error")
+        if self.no_target:
+            return None  # K6: no headphone, no mixer - nothing starts
+        self.clips.append((sound_id, len(samples), volume))
+        self.playing.add(sound_id)
+        return object()  # any non-None sentinel; callers only check for None
 
     def is_loaded(self, sound_id):
         return sound_id in self.loaded
@@ -53,17 +69,22 @@ class FakeEngine:
         self.forgotten.append(sound_id)
         self.loaded.discard(sound_id)
 
-    def play(self, sound_id, volume=1.0, monitor_only=False):
+    def play(self, sound_id, volume=1.0, monitor_only=False, music=False):
         self._record("play")
         if sound_id not in self.loaded:
             raise KeyError(sound_id)
         if self.fail_play:
             self.fail_play = False
             raise RuntimeError("fake device error")
+        if self.no_target:
+            return None  # K6: no headphone, no mixer/VoiceMeeter - nothing starts
         self.plays.append((sound_id, volume))
         if monitor_only:
             self.monitor_only.append(sound_id)
+        if music:
+            self.music_plays.append(sound_id)
         self.playing.add(sound_id)
+        return object()  # any non-None sentinel; callers only check for None
 
     def playing_ids(self):
         self._record("playing_ids")
@@ -86,17 +107,24 @@ class FakeSink:
         self.mic_muted = False
         self.applied: list[tuple[str, dict]] = []
         self.levels: list[tuple[float, bool, float]] = []
+        self.klangbild: list[tuple] = []  # (music_offset_db, musicbus_db) per apply_levels
         self.music: list = []  # blocks the music bus pushed through the hook
+        self.music_enabled: list[bool] = []  # set_music_enabled() calls, in order
         self.stopped = False
 
     def set_mic_muted(self, muted):
         self.mic_muted = bool(muted)
 
+    def set_music_enabled(self, on):
+        self.music_enabled.append(bool(on))
+
     def apply(self, key, settings):
         self.applied.append((key, dict(settings)))
 
-    def apply_levels(self, offset_db, ducking_enabled, ducking_db):
+    def apply_levels(self, offset_db, ducking_enabled, ducking_db,
+                     music_offset_db=None, musicbus_db=0.0):
         self.levels.append((offset_db, ducking_enabled, ducking_db))
+        self.klangbild.append((music_offset_db, musicbus_db))
 
     def distribute_music(self, block):
         self.music.append(block)
@@ -261,17 +289,53 @@ class FakeReleaseSource:
 class FakeSpotifyApi:
     """Stands in for SpotifyApi: no network. `fail` raises on any call."""
 
-    def __init__(self, user=None, search=None, tracks=None, playlists=None, fail=None,
+    def __init__(self, user=None, search=None, search_albums=None, search_playlists=None,
+                 tracks=None, playlists=None, albums=None, fail=None,
                  has_more=False, playlist_items=None, player=None, devices=None,
-                 send_fail=None, on_send=None):
+                 send_fail=None, on_send=None,
+                 tracks_has_more=False, playlists_has_more=False, albums_has_more=False,
+                 tracks_page2=None, playlists_page2=None, albums_page2=None,
+                 playlist_meta=None, recent=None,
+                 library_contains=None, forbid_playlist=frozenset(), recent_contexts=None):
         self.user = user if user is not None else {
             "display_name": "Jan", "images": [{"url": "https://i.scdn.co/u"}]}
         self.search_items = list(search or [])
+        # The "Alle" chip's album/playlist groups (spec §14.2) - separate from the library's
+        # own `playlists` below, so a test fixture for one cannot leak into the other.
+        self.search_albums = list(search_albums or [])
+        self.search_playlists = list(search_playlists or [])
         self.tracks = list(tracks or [])
         self.playlists = list(playlists or [])
+        self.albums = list(albums or [])
         # what one page of /playlists/{id}/items carries; default: the saved tracks
         self.playlist_items = list(playlist_items if playlist_items is not None else (tracks or []))
         self.has_more = has_more
+        # SpotifyLoadLibraryMore (spec §14.3): a page beyond offset 0, and whether the
+        # library's own list endpoints report a further page - separate from `has_more`
+        # above (search/playlist), so setting one cannot leak into the other's test.
+        self.tracks_has_more = tracks_has_more
+        self.playlists_has_more = playlists_has_more
+        self.albums_has_more = albums_has_more
+        self.tracks_page2 = list(tracks_page2 or [])
+        self.playlists_page2 = list(playlists_page2 or [])
+        self.albums_page2 = list(albums_page2 or [])
+        # GET /playlists/{id} (Task 5, spec §14.4): overrides the default {"id", "name": "Fokus"}
+        # so a test can carry uri/images/items.total through to `spotify.playlist`.
+        self.playlist_meta = dict(playlist_meta) if playlist_meta is not None else None
+        # Task 7: raw track dicts for GET /me/player/recently-played, wrapped in {"track": t}
+        # the way Spotify's own payload does - a test passes the same sequence it expects
+        # collapsed (e.g. [TRACK, TRACK, TRACK2] for the consecutive-repeat check).
+        self.recent = list(recent or [])
+        # Task 2 (2026-09-29): each entry's `context` ({"type": "playlist", "uri": ...} or
+        # None), aligned by index with `self.recent` - see `recent_contexts` in `get()`.
+        self.recent_contexts = list(recent_contexts or [])
+        # Task 8 ("Gefällt mir"): GET /me/library/contains?uris=... answers with the
+        # matching uri's saved state (default False for a uri not named here).
+        self.library_contains = dict(library_contains or {})
+        # GET /playlists/{id} and/or /playlists/{id}/items answer 403 (spec §14.4, "kein
+        # Zugriff"): a subset of {"meta", "items"} - raised as `spotify.Forbidden`, the same
+        # class `_http_error` builds for a plain 403 with no known reason.
+        self.forbid_playlist = set(forbid_playlist)
         self.fail = fail
         self.calls: list[tuple] = []
         self.logins: list[tuple] = []
@@ -316,25 +380,72 @@ class FakeSpotifyApi:
         if self.fail is not None:
             raise self.fail
         if path == "/search":
-            return {"tracks": {"items": self.search_items,
-                               "next": "x" if self.has_more else None}}
+            types = str((params or {}).get("type") or "track").split(",")
+            answer = {}
+            if "track" in types:
+                answer["tracks"] = {"items": self.search_items,
+                                    "next": "x" if self.has_more else None}
+            if "album" in types:
+                answer["albums"] = {"items": self.search_albums,
+                                    "next": "x" if self.has_more else None}
+            if "playlist" in types:
+                answer["playlists"] = {"items": self.search_playlists,
+                                       "next": "x" if self.has_more else None}
+            return answer
         if path == "/me/tracks":
-            return {"items": [{"track": t} for t in self.tracks], "next": None}
+            offset = int((params or {}).get("offset") or 0)
+            page = self.tracks_page2 if offset > 0 else self.tracks
+            # only the first page's `next` is driven by the fixture - the second page
+            # (offset > 0) is the last one in these tests, so it reports none further.
+            more = self.tracks_has_more if offset == 0 else False
+            return {"items": [{"track": t} for t in page], "next": "x" if more else None}
         if path == "/me/playlists":
-            return {"items": self.playlists, "next": None}
+            offset = int((params or {}).get("offset") or 0)
+            page = self.playlists_page2 if offset > 0 else self.playlists
+            more = self.playlists_has_more if offset == 0 else False
+            return {"items": page, "next": "x" if more else None}
         if path == "/me/albums":
-            return {"items": [], "next": None}
+            offset = int((params or {}).get("offset") or 0)
+            page = self.albums_page2 if offset > 0 else self.albums
+            more = self.albums_has_more if offset == 0 else False
+            return {"items": [{"album": a} for a in page], "next": "x" if more else None}
+        if path.startswith("/albums/"):
+            # album detail (E5=a, live 2026-09-29): simplified tracks without `album`
+            if path.endswith("/tracks"):
+                return {"items": list(getattr(self, "album_tracks", [])),
+                        "next": "x" if self.has_more else None}
+            meta = getattr(self, "album_meta", None)
+            return dict(meta) if meta is not None else {"id": path.split("/")[2], "name": "Album"}
         if path.startswith("/playlists/"):
             if path.endswith("/items"):
+                if "items" in self.forbid_playlist:
+                    from soundboard import spotify as _spotify
+                    raise _spotify.Forbidden(detail="HTTP 403")
                 # February 2026: the payload sits under `item`, not `track`
                 return {"items": [{"item": t} for t in self.playlist_items],
                         "next": "x" if self.has_more else None,
                         "total": len(self.playlist_items)}
+            if "meta" in self.forbid_playlist:
+                from soundboard import spotify as _spotify
+                raise _spotify.Forbidden(detail="HTTP 403")
+            if self.playlist_meta is not None:
+                return dict(self.playlist_meta)
             return {"id": path.split("/")[2], "name": "Fokus"}
         if path == "/me/player":
             return dict(self.player)
         if path == "/me/player/devices":
             return {"devices": list(self.devices)}
+        if path == "/me/player/recently-played":
+            # `recent_contexts[i]` (Task 2, 2026-09-29): the `context` of `self.recent[i]`,
+            # aligned by index - a test names only the ones it needs, `None` elsewhere.
+            contexts = self.recent_contexts
+            return {"items": [
+                {"track": t, "context": (contexts[i] if i < len(contexts) else None)}
+                for i, t in enumerate(self.recent)
+            ]}
+        if path == "/me/library/contains":
+            uris = str((params or {}).get("uris") or "").split(",")
+            return [bool(self.library_contains.get(u, False)) for u in uris]
         return {}
 
 
@@ -347,9 +458,11 @@ class FakeMusicBus:
         self.stopped = 0
         self.closed = 0
         self.running_flag = False
+        self.waiting = False
         self.error = None
         self.on_block = None
         self.on_error = None
+        self.on_state = None
 
     @property
     def running(self):
@@ -412,6 +525,27 @@ class QueuedDevices:
 
     def stop(self, *args, **kwargs):
         return self._inline.stop(*args, **kwargs)
+
+
+class QueuedWorkers:
+    """Stands in for `core.workers`: `submit` records the job instead of running it, so a
+    test can hold back a worker task (e.g. Spotify's `_run_search`) and run it later, in
+    whatever order the test wants - that is how the stale-answer guard (R1) gets tested."""
+
+    def __init__(self):
+        self.jobs: list[tuple] = []
+
+    def submit(self, fn, *args) -> None:
+        self.jobs.append((fn, args))
+
+    def run_one(self, index: int = 0) -> None:
+        fn, args = self.jobs.pop(index)
+        fn(*args)
+
+    def run_all(self) -> None:
+        while self.jobs:
+            fn, args = self.jobs.pop(0)
+            fn(*args)
 
 
 def bare_core(engine=None):

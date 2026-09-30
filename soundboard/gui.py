@@ -18,13 +18,15 @@ import customtkinter as ctk
 if TYPE_CHECKING:
     from pathlib import Path
 
-from soundboard import protocol as p, theme
+from soundboard import levels, protocol as p, theme
 from soundboard.layout import signal_check_summary
 from soundboard.library import NOTHING_TO_EXPORT
 from soundboard.packs import sanitize_filename
 from soundboard.routing import NO_VIRTUAL_MIC
 from soundboard.updates import UPDATE_LAUNCH_FAILED, UPDATE_QUESTION, launch_installer
-from soundboard.widgets import AddSoundDialog, HotkeyCaptureDialog, SoundTile, VolumeDialog
+from soundboard.widgets import (
+    AddSoundDialog, HotkeyCaptureDialog, SoundTile, VolumeDialog, _klangbild_cfg,
+)
 
 ctk.set_appearance_mode("dark")
 
@@ -77,6 +79,7 @@ class RuckusRadioApp(ctk.CTk):
         self.state_listeners: list = []
         self._ui_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._sounds_key: str | None = None
+        self._targets_key: str | None = None  # K1: Klangbild targets, tracked apart from sounds
         self._settings_key: str | None = None
         self._reset_shown = False
         self._dead_shown = False
@@ -200,10 +203,22 @@ class RuckusRadioApp(ctk.CTk):
         if not state:
             return
         self.snapshot = state
+        targets = ((state.get("devices") or {}).get("levels") or {}).get("targets") or {}
+        targets_key = json.dumps(targets, sort_keys=True)
         sounds_key = json.dumps(state.get("sounds") or [], sort_keys=True)
         if sounds_key != self._sounds_key:
             self._sounds_key = sounds_key
             self.board.rebuild()  # new tiles reload their icon (icon_rev changed)
+        if targets_key != self._targets_key:
+            # K1: a Klangbild target change (SetKlangbild) alone never touches
+            # state["sounds"] - the per-sound dict is unchanged - so board.rebuild()
+            # (which only replaces a tile whose OWN sound dict changed) would leave
+            # every existing tile's badge showing the old target. Refresh each tile's
+            # badge directly instead of forcing a full tile rebuild for this.
+            self._targets_key = targets_key
+            cfg = _klangbild_cfg(self)
+            for tile in self.board.tiles.values():
+                tile.level_label.configure(text=levels.loudness_badge(tile.sound, cfg))
         playback = state.get("playback") or {}
         self.playing_ids = set(playback.get("playing") or [])
         self.missing_ids = set(playback.get("missing") or [])

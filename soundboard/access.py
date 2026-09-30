@@ -17,19 +17,21 @@ import logging
 import secrets
 
 from .protocol import (
-    AddSound, CheckForUpdates, CompleteOnboarding, DeleteSound, ExportSounds,
-    ImportPack, InstallUpdate, Play, RegenerateViewToken, RemoveHotkey, RenameSound,
-    RequestAddSound,
+    AddSound, CheckForUpdates, ClearSoundTrim, CompleteOnboarding, DeleteSound, ExportSounds,
+    ImportPack, InstallUpdate, LoadWaveform, Play, PreviewTrim, RegenerateViewToken,
+    RemoveHotkey, RenameSound,
+    RequestAddSound, RequestExportTrimmed,
     RequestExportSounds, RequestImportPack, RequestSetSoundIcon, Rescan,
-    ResumeHotkeys, RunSignalCheck, SetAutostart, SetDiscordOutput, SetDiscordSounds,
-    SetHotkey, SetLevels, SetMicrophone,
-    SetMusicBus, SetMusicBusGain, SetOutput, SetOnboardingActive, SetSoundIcon,
-    SetSoundVolume, SetStopAllHotkey, ToggleMicMute,
-    SpotifyLoadLibrary, SpotifyLoadPlaylist, SpotifyLogin, SpotifyLogout,
+    ResumeHotkeys, RunSignalCheck, SetAutostart, SetDiscordMusic, SetDiscordOutput,
+    SetDiscordSounds, SetHotkey, SetKlangbild, SetLevels, SetMicrophone,
+    SetMusicBus, SetMusicBusGain, SetOutput, SetOnboardingActive, SetSidebarPins, SetSoundCategory,
+    SetSoundIcon, SetSoundTrim, SetSoundVolume, SetStopAllHotkey, ToggleMicMute,
+    SpotifyLoadAlbum, SpotifyLoadLibrary, SpotifyLoadPlaylist, SpotifyLogin, SpotifyLogout,
     SpotifySearch, SpotifySearchMore, Stop, StopAll, SuspendHotkeys,
     SpotifyPlay, SpotifyPause, SpotifyResume, SpotifyNext, SpotifyPrevious,
     SpotifySeek, SpotifySetVolume, SpotifySetShuffle, SpotifySetRepeat,
     SpotifyAddToQueue, SpotifyTransfer, SpotifyLoadDevices,
+    SpotifyLoadLibraryMore, SpotifyLoadRecent, SpotifySetSaved,
 )
 
 log = logging.getLogger(__name__)
@@ -62,16 +64,21 @@ COMMAND_CAPABILITY: dict[type, str] = {
     SetMusicBus: PLAYBACK, SetMusicBusGain: PLAYBACK,
     # muting Discord is part of playing sounds for friends (Jan, 2026-09-27); it moves
     # only the sounds switch of Discord's cable, never a level or a device
-    SetDiscordSounds: PLAYBACK,
+    SetDiscordSounds: PLAYBACK, SetDiscordMusic: PLAYBACK,
     SuspendHotkeys: CAPTURE, ResumeHotkeys: CAPTURE,
     AddSound: LIBRARY, DeleteSound: LIBRARY, RenameSound: LIBRARY,
-    SetSoundIcon: LIBRARY, SetSoundVolume: LIBRARY, SetHotkey: LIBRARY,
-    RemoveHotkey: LIBRARY, SetStopAllHotkey: LIBRARY, ExportSounds: LIBRARY,
+    SetSoundIcon: LIBRARY, SetSoundVolume: LIBRARY, SetSoundCategory: LIBRARY,
+    SetHotkey: LIBRARY,
+    RemoveHotkey: LIBRARY, SetStopAllHotkey: LIBRARY, SetSidebarPins: LIBRARY, ExportSounds: LIBRARY,
     ImportPack: LIBRARY,
     # Die vier Request*-Befehle (LIBRARY): die Seite bittet, Python oeffnet den Dialog.
     RequestAddSound: LIBRARY, RequestImportPack: LIBRARY,
     RequestExportSounds: LIBRARY, RequestSetSoundIcon: LIBRARY,
-    SetOutput: SETTINGS, SetLevels: SETTINGS, SetMicrophone: SETTINGS,
+    # C8 Kürzen (Z7): ändert die Bibliothek wie Umbenennen - nur das Fenster. Auch das
+    # Vorhören und die Wellenform, weil nur der Editor sie braucht.
+    LoadWaveform: LIBRARY, PreviewTrim: LIBRARY, SetSoundTrim: LIBRARY,
+    ClearSoundTrim: LIBRARY, RequestExportTrimmed: LIBRARY,
+    SetOutput: SETTINGS, SetLevels: SETTINGS, SetKlangbild: SETTINGS, SetMicrophone: SETTINGS,
     SetDiscordOutput: SETTINGS,
     ToggleMicMute: SETTINGS, SetAutostart: SETTINGS, RegenerateViewToken: SETTINGS,
     Rescan: DIAGNOSTICS, RunSignalCheck: DIAGNOSTICS,
@@ -82,13 +89,17 @@ COMMAND_CAPABILITY: dict[type, str] = {
     # Ein Konto verbinden oder trennen darf nur das Fenster - ein Lesezeichen im Overlay
     # soll kein Konto anfassen.
     SpotifySearch: MUSIC, SpotifySearchMore: MUSIC,
-    SpotifyLoadLibrary: MUSIC, SpotifyLoadPlaylist: MUSIC,
+    SpotifyLoadLibrary: MUSIC, SpotifyLoadPlaylist: MUSIC, SpotifyLoadAlbum: MUSIC,
     SpotifyLogin: MUSIC_ACCOUNT, SpotifyLogout: MUSIC_ACCOUNT,
     # F2-Transport (Spec §13.1): PLAYBACK, damit auch die Ansicht steuern darf.
     SpotifyPlay: PLAYBACK, SpotifyPause: PLAYBACK, SpotifyResume: PLAYBACK,
     SpotifyNext: PLAYBACK, SpotifyPrevious: PLAYBACK, SpotifySeek: PLAYBACK,
     SpotifySetVolume: PLAYBACK, SpotifySetShuffle: PLAYBACK, SpotifySetRepeat: PLAYBACK,
     SpotifyAddToQueue: PLAYBACK, SpotifyTransfer: PLAYBACK, SpotifyLoadDevices: PLAYBACK,
+    # F3 (Spec §14): mehr laden und Zuletzt gespielt sind Lesen wie Suchen/Ansehen -
+    # die Ansicht darf beides. Einen Titel speichern aendert das Konto, bleibt Fenster-Sache.
+    SpotifyLoadLibraryMore: MUSIC, SpotifyLoadRecent: MUSIC,
+    SpotifySetSaved: MUSIC_ACCOUNT,
 }
 
 ROLE_CAPABILITIES: dict[str, frozenset] = {

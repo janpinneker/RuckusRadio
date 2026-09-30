@@ -143,6 +143,12 @@ def test_an_update_run_brings_one_notice_with_whats_new():
     assert "1.3.0" in spotify and "Spotify" in spotify and "Premium" in spotify, spotify
     assert "Browser" in spotify, "the view link may steer too - say so"
     assert "Musik ins Mikrofon" in spotify, "the music bus is new in 1.3.0 too"
+    [routing] = app_main.startup_notices(["--updated"], "1.4.0")
+    assert "Playlists" in routing and "Alben" in routing, "F3: library, playlists, albums"
+    assert "nur noch Spotify" in routing, "the music bus no longer carries game or PC sound"
+    assert "Discord: Musik" in routing, "name the new dock button"
+    assert "Seitenleiste" in routing and "Kürzen" in routing, "pins and the trim editor are new in 1.4.0"
+    assert "gleicht" in routing, "the bus levels itself: the Spotify slider is only for your ears"
     [plain] = app_main.startup_notices(["--updated"], "9.9.9")
     assert "9.9.9" in plain and "Web-Oberfläche" not in plain, "no news without an entry"
     assert app_main.parse_mode(["--updated"]) == "web", "--updated changes no start path"

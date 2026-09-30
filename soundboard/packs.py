@@ -2,7 +2,7 @@
 
 Pack layout (zip, deflate):
     manifest.json                 {"format": "ruckuspack", "version": 1, "sounds": [<folder>, ...]}
-    <folder>/meta.json            {"name": str, "volume": float, "audio": <filename in folder>}
+    <folder>/meta.json            {"name": str, "volume": float, "audio": <filename in folder>, "trim"?: {"start", "end"}}
     <folder>/<audio filename>     the sound's mp3
     <folder>/icon.png             optional
 
@@ -32,7 +32,7 @@ from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
-from soundboard import config, icons
+from soundboard import config, icons, levels, trimming
 
 MANIFEST_NAME = "manifest.json"
 PACK_FORMAT = "ruckuspack"
@@ -119,6 +119,10 @@ def export_pack(config_data: dict[str, Any], data_dir: Path, sound_ids: list[str
                     zf.write(icon_src, f"{folder}/icon.png")
 
                 meta = {"name": sound["name"], "volume": sound.get("volume", 1.0), "audio": audio_name}
+                if sound.get("trim"):
+                    meta["trim"] = sound["trim"]  # C8: the cut travels, the file stays whole
+                if sound.get("category"):
+                    meta["category"] = sound["category"]  # F5: only when set by hand/measurement
                 zf.writestr(f"{folder}/meta.json", json.dumps(meta, ensure_ascii=False))
 
             zf.writestr(MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False))
@@ -226,6 +230,10 @@ def import_pack(pack_path: Path, existing_names: set[str], data_dir: Path) -> li
                 raise _corrupt(f"Audiodatei von „{name}“ ist unlesbar")
 
             volume = config.clamp_volume(meta.get("volume", 1.0))
+            # F5: only a known category is trusted from a foreign pack; "duration" is
+            # never taken from meta either way - it gets measured fresh after import.
+            category = meta.get("category")
+            category = category if category in levels.CATEGORIES else None
 
             icon_member = f"{folder}/icon.png"
             icon_bytes = None
@@ -241,6 +249,8 @@ def import_pack(pack_path: Path, existing_names: set[str], data_dir: Path) -> li
                 "audio_bytes": audio_bytes,
                 "audio_ext": ext,
                 "icon_bytes": icon_bytes,
+                "trim": trimming.clean_trim(meta.get("trim")),
+                "category": category,
             })
 
         # All validated — now actually write files (only computed destination
@@ -284,6 +294,10 @@ def import_pack(pack_path: Path, existing_names: set[str], data_dir: Path) -> li
                     "hotkey": None,
                     "volume": item["volume"],
                 }
+                if item["trim"] is not None:
+                    sound["trim"] = item["trim"]
+                if item["category"] is not None:
+                    sound["category"] = item["category"]
                 new_sounds.append(sound)
         except Exception as exc:
             for path in written_paths:

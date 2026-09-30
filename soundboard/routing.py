@@ -18,7 +18,8 @@ from typing import Callable
 from . import config, defaultdevice, devices, levels, miccheck, sinkgroup
 from .layout import output_rows, virtual_mic_status
 from .protocol import (DevicesChanged, HeadphonesSwitched, Rescan, RunSignalCheck,
-                       SetDiscordOutput, SetDiscordSounds, SetLevels, SetMicrophone, SetOnboardingActive,
+                       SetDiscordMusic, SetDiscordOutput, SetDiscordSounds, SetKlangbild,
+                       SetLevels, SetMicrophone, SetOnboardingActive,
                        SetOutput, SignalCheckDone, ToggleMicMute)
 
 log = logging.getLogger(__name__)
@@ -86,9 +87,11 @@ class RoutingService:
         self._mute_seq = 0  # core thread: bumped on every toggle, carried through device jobs
         core.handle(SetOutput, self.set_output)
         core.handle(SetLevels, self.set_levels)
+        core.handle(SetKlangbild, self.set_klangbild)
         core.handle(SetMicrophone, self.set_microphone)
         core.handle(SetDiscordOutput, self.set_discord_output)
         core.handle(SetDiscordSounds, self.set_discord_sounds)
+        core.handle(SetDiscordMusic, self.set_discord_music)
         core.handle(ToggleMicMute, self.toggle_mic)
         core.handle(RunSignalCheck, self.run_signal_check)
         core.handle(Rescan, lambda _cmd: self.rescan())
@@ -263,14 +266,36 @@ class RoutingService:
                 self.cfg[name] = bool(value)
             elif name in ("sounds_offset_db", "ducking_db"):
                 self.cfg[name] = float(value)
-        offset = levels.sounds_offset_db(self.cfg)
-        enabled, depth = levels.ducking(self.cfg)
-        self._with_sink(lambda sink: sink.apply_levels(offset, enabled, depth))
+        self._apply_levels()
         if "ducking_enabled" in cmd.changes:
             self._core.store.save_now()
         else:
             self._core.store.save_soon()
         self._core.state_changed()
+
+    def set_klangbild(self, cmd: SetKlangbild) -> None:
+        """Klangbild K3/K4: targets per category and "Musik unter Stimme". New plays
+        use the new targets at once (playback reads the config); the offsets and the
+        bus compensation reach the mixer here."""
+        targets = levels.category_targets(self.cfg)
+        for name, value in cmd.changes.items():
+            if name in levels.CATEGORIES:
+                targets[name] = levels.clamp_target(name, value)
+            elif name == "music_offset_db":
+                self.cfg["music_offset_db"] = levels.music_offset_db({"music_offset_db": value})
+        self.cfg["klangbild_targets"] = targets
+        self._apply_levels()
+        self._core.store.save_soon()
+        self._core.state_changed()
+
+    def _apply_levels(self) -> None:
+        """Every mixer level at once - SetLevels and SetKlangbild both land here."""
+        offset = levels.sounds_offset_db(self.cfg)
+        enabled, depth = levels.ducking(self.cfg)
+        music_offset = levels.music_offset_db(self.cfg)
+        bus_db = levels.musicbus_compensation_db(self.cfg)
+        self._with_sink(lambda sink: sink.apply_levels(offset, enabled, depth,
+                                                       music_offset, bus_db))
 
     def toggle_mic(self, _cmd: ToggleMicMute) -> None:
         if not self.mixer_running:
@@ -320,6 +345,12 @@ class RoutingService:
         if key is None:
             return
         self.set_output(SetOutput(key, {"sounds": bool(cmd.on)}))
+
+    def set_discord_music(self, cmd: SetDiscordMusic) -> None:
+        key = self._discord_device_name()
+        if key is None:
+            return
+        self.set_output(SetOutput(key, {"music": bool(cmd.on)}))
 
     def _discord_device_name(self) -> str | None:
         """The cable Discord records from: the user's choice while that cable exists,
@@ -465,5 +496,7 @@ class RoutingService:
             "default_mic": self.resolved.get("default_mic"),
             "monitor_name": self.resolved.get("monitor_name"),
             "levels": {"sounds_offset_db": levels.sounds_offset_db(self.cfg),
-                       "ducking_enabled": enabled, "ducking_db": depth},
+                       "ducking_enabled": enabled, "ducking_db": depth,
+                       "targets": levels.category_targets(self.cfg),
+                       "music_offset_db": levels.music_offset_db(self.cfg)},
         }

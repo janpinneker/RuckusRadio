@@ -41,6 +41,8 @@ def test_fields_carry_type_and_required():
     assert data["commands"]["StopAll"] == {}
     assert data["commands"]["ExportSounds"]["sound_ids"]["type"] == "tuple[str, ...] | None"
     assert data["events"]["Notice"]["level"] == {"required": False, "type": "str"}
+    assert data["events"]["WaveformLoaded"]["peaks"] == {"required": True, "type": "tuple[float, ...]"}
+    assert data["commands"]["SetSoundTrim"]["start"] == {"required": True, "type": "float"}
     print("field types and required flags: OK")
 
 

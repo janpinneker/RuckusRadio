@@ -69,7 +69,7 @@ def pull(target):
 
 
 def settings(**kw):
-    base = {"mic": True, "mic_gain": 1.0, "sounds": True, "sounds_gain": 1.0}
+    base = {"mic": True, "mic_gain": 1.0, "sounds": True, "sounds_gain": 1.0, "music": True}
     base.update(kw)
     return base
 
@@ -181,7 +181,7 @@ def test_failing_target_does_not_stop_the_group():
 def test_running_stays_true_when_every_target_is_off():
     """AudioEngine.play falls back to its direct path when running is False, which
     would write into the cable behind the user's back. running describes the group."""
-    a = fake_target("a", settings(mic=False, sounds=False))
+    a = fake_target("a", settings(mic=False, sounds=False, music=False))
     group = sinkgroup.SinkGroup([a], mic_device=None)
     group.start()
     assert a.wants_stream is False, "nothing to send means no open stream"
@@ -192,13 +192,13 @@ def test_running_stays_true_when_every_target_is_off():
 
 
 def test_apply_reopens_a_switched_on_target():
-    a = fake_target("a", settings(mic=False, sounds=False))
+    a = fake_target("a", settings(mic=False, sounds=False, music=False))
     group = sinkgroup.SinkGroup([a], mic_device=None)
     group.start()
     assert a._stream is None
     group.apply("a", settings(mic=True, sounds=True))
     assert a._stream is not None, "switching something on opens the stream again"
-    group.apply("a", settings(mic=False, sounds=False))
+    group.apply("a", settings(mic=False, sounds=False, music=False))
     assert a._stream is None, "switching everything off closes it"
     group.stop()
     print("apply reopens a switched-on target: OK")
@@ -528,20 +528,137 @@ def test_sound_limiter_catches_overlaps():
     print("two overlapping sounds stay below -1 dBFS: OK")
 
 
-def test_music_reaches_every_sounds_target_and_nobody_steals_the_block():
-    """Musik-Bus (Spec §4): Muster _distribute_mic - eine Queue je Ziel, kein Ziel
-    darf einem anderen Bloecke wegnehmen."""
+def test_music_reaches_every_music_target_and_nobody_steals_the_block():
+    """Musik-Bus: Muster _distribute_mic - eine Queue je Ziel. Entscheidend ist der
+    eigene Schalter `music`, nicht `sounds` (Spec audio-routing §4)."""
     a = fake_target("a", settings(mic=False))
-    b = fake_target("b", settings(mic=False))
-    off = fake_target("off", settings(mic=False, sounds=False))
+    b = fake_target("b", settings(mic=False, sounds=False))
+    off = fake_target("off", settings(mic=False, music=False))
     group = sinkgroup.SinkGroup([a, b, off], mic_device=None)
     group.start()
     group.distribute_music(tone(0.3))
-    assert np.allclose(pull(a), 0.3) and np.allclose(pull(b), 0.3), \
-        "beide Ziele erhalten denselben Block"
-    assert not pull(off).any(), "sounds aus: keine Musik"
+    assert np.allclose(pull(a), 0.3), "Musik an"
+    assert np.allclose(pull(b), 0.3), "Sounds aus, Musik an: Musik kommt trotzdem"
+    assert not pull(off).any(), "Musik aus: keine Musik"
     group.stop()
-    print("Musik erreicht jedes sounds-Ziel, niemand stiehlt Bloecke: OK")
+    print("Musik folgt dem eigenen Schalter, niemand stiehlt Bloecke: OK")
+
+
+def test_a_music_only_cable_keeps_its_stream_only_while_the_bus_is_on():
+    """Final-Fix F2: der Musik-Schalter allein haelt kein Kabel offen - ohne
+    laufenden Bus kommen ohnehin nie Bloecke, also soll das Kabel dann auch kein
+    PortAudio-Geraet belegen. `_music_wanted` (von der Gruppe gesetzt) entscheidet."""
+    cable = fake_target("cable", settings(mic=False, sounds=False, music=True))
+    assert cable._music_wanted is False, "Anfangswert: kein Bus, nichts gewollt"
+    assert not cable.wants_stream, "Bus aus: der Musik-Schalter allein oeffnet nichts"
+    cable._music_wanted = True
+    assert cable.wants_stream, "Bus an: jetzt haelt der Musik-Schalter den Strom offen"
+    cable._music_wanted = False
+    assert not cable.wants_stream
+    print("ein Kabel nur mit Musik bleibt nur offen, waehrend der Bus an ist: OK")
+
+
+def test_set_music_enabled_opens_and_closes_a_music_only_cable():
+    cable = fake_target("cable", settings(mic=False, sounds=False, music=True))
+    group = sinkgroup.SinkGroup([cable], mic_device=None)
+    group.start()
+    assert cable._stream is None, "Bus aus beim Start: das reine Musik-Kabel bleibt zu"
+
+    group.set_music_enabled(True)
+    assert cable._stream is not None, "Bus an: das Kabel oeffnet, obwohl nur Musik an ist"
+
+    group.set_music_enabled(False)
+    assert cable._stream is None, "Bus wieder aus: schliesst wieder"
+    group.stop()
+    print("set_music_enabled oeffnet/schliesst ein reines Musik-Kabel: OK")
+
+
+def test_set_music_enabled_does_not_close_a_cable_that_wants_a_stream_anyway():
+    cable = fake_target("cable", settings(mic=False, sounds=True, music=True))
+    group = sinkgroup.SinkGroup([cable], mic_device=None)
+    group.start()
+    assert cable._stream is not None, "sounds allein reicht schon fuer einen offenen Strom"
+    group.set_music_enabled(False)
+    assert cable._stream is not None, "sounds haelt den Strom offen, unabhaengig vom Bus"
+    group.stop()
+    print("set_music_enabled schliesst kein Kabel, das ohnehin einen Strom will: OK")
+
+
+def test_set_music_enabled_does_not_retry_an_already_failed_target():
+    """M5: ein Ziel mit open_failed darf set_music_enabled nicht bei jedem Umschalten
+    erneut mit _open_stream versuchen."""
+    cable = fake_target("cable", settings(mic=False, sounds=False, music=True), fail=True)
+    cable.open_failed = True
+    calls = []
+    boom = cable._open_stream
+
+    def counting():
+        calls.append(1)
+        return boom()
+
+    cable._open_stream = counting
+    group = sinkgroup.SinkGroup([cable], mic_device=None)
+    group.set_music_enabled(True)
+    assert calls == [], "ein bereits fehlgeschlagenes Ziel wird nicht erneut versucht"
+    print("set_music_enabled versucht ein open_failed-Ziel nicht erneut: OK")
+
+
+def test_build_sets_the_initial_music_wanted_from_the_config():
+    cfg = config._default_config()
+    cfg["musicbus_enabled"] = True
+    resolved = {
+        "virtual_mics": [{"key": "CABLE Output", "label": "CABLE", "out_index": 29,
+                          "in_index": 39}],
+        "monitor": None, "mic": None,
+    }
+    group = sinkgroup.build(cfg, resolved, open_streams=False)
+    cable = group.target("CABLE Output")
+    assert cable._music_wanted is True, "der Anfangswert kommt aus musicbus_enabled"
+
+    cfg["musicbus_enabled"] = False
+    group = sinkgroup.build(cfg, resolved, open_streams=False)
+    assert group.target("CABLE Output")._music_wanted is False
+    print("build setzt den Musik-Anfangswert aus musicbus_enabled: OK")
+
+
+def test_switching_music_off_drops_queued_music():
+    cable = fake_target("cable", settings(mic=False))
+    group = sinkgroup.SinkGroup([cable], mic_device=None)
+    group.start()
+    group.distribute_music(tone(0.3))
+    group.apply("cable", settings(mic=False, music=False))
+    group.apply("cable", settings(mic=False, music=True))
+    assert not pull(cable).any(), "alte Musikbloecke kommen nach dem Ausschalten nicht nach"
+    group.stop()
+    print("Musik aus leert die Musik-Queue: OK")
+
+
+def test_no_stale_music_block_after_switching_music_back_on():
+    """Race: der Musik-Bus-Faden liest `target.music` als True kurz bevor apply() es
+    auf False setzt und drained - danach legt er trotzdem noch einen Block ab. Der
+    darf beim naechsten Anschalten nicht mehr da sein."""
+    cable = fake_target("cable", settings(mic=False, music=True))
+    group = sinkgroup.SinkGroup([cable], mic_device=None)
+    group.start()
+    group.apply("cable", settings(mic=False, music=False))
+    cable.push_music(tone(0.3))  # der spaete Block vom Bus-Faden
+    group.apply("cable", settings(mic=False, music=True))
+    assert not pull(cable).any(), "kein liegen gebliebener Block nach dem Wiederanschalten"
+    group.stop()
+    print("kein liegen gebliebener Musikblock nach dem Wiederanschalten: OK")
+
+
+def test_turning_music_on_drains_whatever_was_left_in_the_queue():
+    """M7: das Leeren beim Einschalten allein pruefen, ohne den push_music-Guertel
+    zu benutzen - die Queue wird direkt befuellt, waehrend music noch False ist."""
+    cable = fake_target("cable", settings(mic=False, music=False))
+    group = sinkgroup.SinkGroup([cable], mic_device=None)
+    group.start()
+    cable._music_queue.put_nowait(tone(0.3))
+    group.apply("cable", settings(mic=False, music=True))
+    assert not pull(cable).any(), "beim Einschalten wird die Queue geleert"
+    group.stop()
+    print("Einschalten allein leert die Musik-Queue: OK")
 
 
 def test_music_runs_through_the_sound_branch():
@@ -564,18 +681,16 @@ def test_music_runs_through_the_sound_branch():
     print("Musik laeuft durch den Sound-Zweig (Offset + Ducking): OK")
 
 
-def test_the_monitor_hears_the_music_unregulated():
-    """Kopfhörer: sounds_offset 1.0, kein Ducker - was andere hoeren wird geregelt,
-    das eigene Mithoeren nicht (Spec §4)."""
-    monitor = fake_target(config.MONITOR_KEY, settings(mic=False))
-    group = start_with_mic(sinkgroup.SinkGroup([monitor], mic_device=None))
-    group.apply_levels(-6.0, True, -6.0)
-    group.voice.speaking = True
+def test_the_headphones_never_get_music():
+    """Prämisse 3: Jan hoert Spotify direkt - keine Verdopplung, keine Rueckkopplung.
+    Auch ein (falsch) gesetzter Schalter am Kopfhoerer aendert daran nichts."""
+    monitor = fake_target(config.MONITOR_KEY, settings(mic=False, music=True))
+    group = sinkgroup.SinkGroup([monitor], mic_device=None)
+    group.start()
     group.distribute_music(tone(0.4))
-    assert np.allclose(pull(monitor), 0.4), "kein Offset, kein Duck"
-    assert monitor.ducker is None and monitor.sounds_offset == 1.0
+    assert not pull(monitor).any(), "keine Musik auf den Kopfhoerern"
     group.stop()
-    print("Kopfhoerer hoert die Musik unreguliert: OK")
+    print("Kopfhoerer bekommen nie Musik: OK")
 
 
 def test_build_applies_the_configured_levels():
@@ -625,6 +740,83 @@ def test_switching_sounds_off_silences_a_playing_sound_on_that_target_only():
     print("switching sounds off silences a playing sound on that target only: OK")
 
 
+def test_music_sounds_sit_under_the_voice_by_their_own_offset():
+    """Klangbild K4: "Sounds unter Stimme" gilt fuer Effekte, "Musik unter Stimme" fuer
+    Musik - beide im selben Sound-Zweig (Ducking, Limiter). Kopfhoerer bleiben neutral."""
+    cable = fake_target("CABLE Output", settings(mic=False))
+    monitor = fake_target(config.MONITOR_KEY, settings(mic=False))
+    group = start_with_mic(sinkgroup.SinkGroup([cable, monitor], mic_device=None))
+    group.apply_levels(-6.0, False, -6.0, music_offset_db=-3.0)
+    group.add_source(tone(0.2), gain=1.0)
+    group.add_source(tone(0.2), gain=1.0, music=True)
+    expected = 0.2 * dynamics.db_to_gain(-6.0) + 0.2 * dynamics.db_to_gain(-3.0)
+    out = pull(cable)
+    assert np.allclose(out, expected, atol=1e-6), float(out[0, 0])
+    assert np.allclose(pull(monitor), 0.4, atol=1e-6), "Kopfhoerer: beide voll"
+    group.stop()
+    print("Musik hat ihren eigenen Abstand unter der Stimme: OK")
+
+
+def test_without_a_music_offset_music_follows_the_sound_offset():
+    cable = fake_target("CABLE Output", settings(mic=False))
+    group = start_with_mic(sinkgroup.SinkGroup([cable], mic_device=None))
+    group.apply_levels(-6.0, False, -6.0)
+    group.add_source(tone(0.2), gain=1.0, music=True)
+    assert np.allclose(pull(cable), 0.2 * dynamics.db_to_gain(-6.0), atol=1e-6)
+    group.stop()
+    print("alter Aufruf ohne Musik-Abstand: Musik wie Effekte: OK")
+
+
+def test_the_music_bus_gets_the_fixed_compensation_and_the_music_offset():
+    """Klangbild K5: Bus-Bloecke bekommen `music_target - (-14)` dB und danach, wie jede
+    Musik, "Musik unter Stimme"."""
+    cable = fake_target("CABLE Output", settings(mic=False))
+    group = start_with_mic(sinkgroup.SinkGroup([cable], mic_device=None))
+    group.apply_levels(0.0, False, -6.0, music_offset_db=-3.0, musicbus_db=4.0)
+    group.distribute_music(tone(0.1))
+    expected = 0.1 * dynamics.db_to_gain(4.0) * dynamics.db_to_gain(-3.0)
+    out = pull(cable)
+    assert np.allclose(out, expected, atol=1e-6), float(out[0, 0])
+    group.stop()
+    print("Musik-Bus: fester Ausgleich plus Musik-Abstand: OK")
+
+
+def test_music_sources_leave_no_trace():
+    cable = fake_target("CABLE Output", settings(mic=False))
+    group = start_with_mic(sinkgroup.SinkGroup([cable], mic_device=None))
+    handle = group.add_source(tone(0.2), gain=1.0, music=True)
+    assert len(cable._music_sources) == 1
+    group.remove(handle)
+    assert not cable._music_sources, "remove"
+    group.add_source(tone(0.2), gain=1.0, music=True)
+    group.stop_all_sources()
+    assert not cable._music_sources, "stop_all_sources"
+    group.add_source(tone(0.2), gain=1.0, music=True)
+    pull(cable)
+    pull(cable)  # der Ton ist nach einem Block zu Ende
+    assert not cable._music_sources, "fertig gespielt"
+    group.stop()
+    print("Musikquellen hinterlassen keine Spuren: OK")
+
+
+def test_build_applies_the_klangbild_levels():
+    cfg = config._default_config()
+    cfg["music_offset_db"] = -9.0
+    cfg["klangbild_targets"] = {"effect": -20.0, "music": -12.0}
+    resolved = {
+        "virtual_mics": [{"key": "CABLE Output (VB-Audio Virtual Cable)", "label": "CABLE",
+                          "out_index": 29, "in_index": 39}],
+        "monitor": 5,
+        "mic": None,
+    }
+    group = sinkgroup.build(cfg, resolved, open_streams=False)
+    cable, monitor = group.targets
+    assert abs(cable.music_offset - dynamics.db_to_gain(-9.0)) < 1e-12
+    assert abs(cable.musicbus_trim - dynamics.db_to_gain(2.0)) < 1e-12
+    assert monitor.music_offset == 1.0
+    print("build uebernimmt die Klangbild-Pegel: OK")
+
+
 def main():
     test_mic_block_reaches_every_target()
     test_each_target_mixes_its_own_way()
@@ -652,12 +844,25 @@ def main():
     test_ducking_lowers_sounds_while_speaking()
     test_muted_mic_never_ducks()
     test_sound_limiter_catches_overlaps()
-    test_music_reaches_every_sounds_target_and_nobody_steals_the_block()
+    test_music_reaches_every_music_target_and_nobody_steals_the_block()
+    test_a_music_only_cable_keeps_its_stream_only_while_the_bus_is_on()
+    test_set_music_enabled_opens_and_closes_a_music_only_cable()
+    test_set_music_enabled_does_not_close_a_cable_that_wants_a_stream_anyway()
+    test_set_music_enabled_does_not_retry_an_already_failed_target()
+    test_build_sets_the_initial_music_wanted_from_the_config()
+    test_switching_music_off_drops_queued_music()
+    test_no_stale_music_block_after_switching_music_back_on()
+    test_turning_music_on_drains_whatever_was_left_in_the_queue()
     test_music_runs_through_the_sound_branch()
-    test_the_monitor_hears_the_music_unregulated()
+    test_the_headphones_never_get_music()
     test_build_applies_the_configured_levels()
     test_a_level_change_reaches_a_sound_that_is_already_playing()
     test_switching_sounds_off_silences_a_playing_sound_on_that_target_only()
+    test_music_sounds_sit_under_the_voice_by_their_own_offset()
+    test_without_a_music_offset_music_follows_the_sound_offset()
+    test_the_music_bus_gets_the_fixed_compensation_and_the_music_offset()
+    test_music_sources_leave_no_trace()
+    test_build_applies_the_klangbild_levels()
     print("\nALL SINKGROUP LOGIC CHECKS PASSED")
 
 

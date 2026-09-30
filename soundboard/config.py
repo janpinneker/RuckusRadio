@@ -27,12 +27,13 @@ log = logging.getLogger(__name__)
 last_load_was_reset = False
 
 DEFAULT_OUTPUT: dict[str, Any] = {
-    "mic": True, "mic_gain": 1.0, "sounds": True, "sounds_gain": 1.0,
+    "mic": True, "mic_gain": 1.0, "sounds": True, "sounds_gain": 1.0, "music": True,
 }
 # The headphones are a target like any other, but hearing your own voice is
-# off unless the user asks for it.
+# off unless the user asks for it. Music never goes there: Spotify already plays
+# on them directly (spec audio-routing-spotify, premise 3).
 DEFAULT_MONITOR_OUTPUT: dict[str, Any] = {
-    "mic": False, "mic_gain": 0.0, "sounds": True, "sounds_gain": 0.5,
+    "mic": False, "mic_gain": 0.0, "sounds": True, "sounds_gain": 0.5, "music": False,
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -44,12 +45,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_mic_gain": 1.0,
     "discord_output": None,  # output row key Discord records from; None = the primary cable
     "autostart": False,
+    "sidebar_pins": [],  # entries the user pinned to the sidebar (spec spotify-bereich D3)
     "monitor_device": "default",
     "stop_all_hotkey": "ctrl+ß",  # Strg+ß: types nothing, no AltGr (spec C9, user 2026-09-26)
     "stop_all_migrated": True,  # new installs never run the one-time migration below
     "sounds_offset_db": -6.0,  # sounds sit this far below the voice on every cable
     "ducking_enabled": True,  # lower the sounds on the cables while the user speaks
     "ducking_db": -6.0,
+    # Klangbild (spec 2026-09-28-klangbild, K3/K4): loudness target per category in
+    # LUFS, and how far music sits under the voice on the cables.
+    "klangbild_targets": {"effect": -20.0, "music": -14.0},
+    "music_offset_db": -3.0,
     # Spotify's public client id (PKCE, no secret). Empty = the music tab shows a hint.
     "spotify_client_id": "",
     # F2: last chosen Spotify Connect device (only the id, spec §13.3)
@@ -248,7 +254,7 @@ def clamp_gain(value: Any) -> float:
 
 def output_settings(cfg: dict[str, Any], key: str, is_monitor: bool = False,
                     is_voicemeeter: bool = False) -> dict[str, Any]:
-    """The four settings for one target, always complete. Reading never writes.
+    """The five settings for one target, always complete. Reading never writes.
 
     VoiceMeeter starts with the microphone OFF: it does its own mixing, and taking the
     microphone from here would take it away from VoiceMeeter. The user can switch it on."""
@@ -258,10 +264,18 @@ def output_settings(cfg: dict[str, Any], key: str, is_monitor: bool = False,
         base["mic_gain"] = clamp_gain(cfg.get("default_mic_gain", 1.0))
     stored = (cfg.get("outputs") or {}).get(key)
     if isinstance(stored, dict):
+        # F1 (Final-Fix, 2026-09-29): ein gespeicherter Eintrag ohne den Schluessel
+        # `music` (jede Config vor diesem Feature) soll nicht stumpf auf True landen -
+        # er folgt `sounds`, damit ein Kabel, das vorher stumm geschaltet war, nach dem
+        # Update nicht ploetzlich Musik ins Gespraech mischt. Ein Eintrag OHNE `sounds`
+        # (kein Kabel je gesehen) bleibt beim Default True.
+        if not is_monitor and "music" not in stored and "sounds" in stored:
+            base["music"] = bool(stored["sounds"])
         base.update({k: stored[k] for k in base if k in stored})
     return {
         "mic": bool(base["mic"]), "mic_gain": clamp_gain(base["mic_gain"]),
         "sounds": bool(base["sounds"]), "sounds_gain": clamp_gain(base["sounds_gain"]),
+        "music": False if is_monitor else bool(base["music"]),
     }
 
 
@@ -275,10 +289,12 @@ def set_output_settings(cfg: dict[str, Any], key: str, **changes: Any) -> dict[s
     current = output_settings(cfg, key, is_monitor=is_monitor,
                               is_voicemeeter=is_voicemeeter_key(key))
     for name, value in changes.items():
-        if name in ("mic", "sounds"):
+        if name in ("mic", "sounds", "music"):
             current[name] = bool(value)
         elif name in ("mic_gain", "sounds_gain"):
             current[name] = clamp_gain(value)
+    if is_monitor:
+        current["music"] = False
     cfg.setdefault("outputs", {})[key] = current
     return dict(current)
 

@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 SOUND_TYPES = [("Audio", "*.mp3 *.mp4"), ("Alle Dateien", "*.*")]
 ICON_TYPES = [("Bilder", "*.png *.jpg *.jpeg *.webp *.bmp"), ("Alle Dateien", "*.*")]
 PACK_TYPES = [("Ruckus-Paket", "*.ruckuspack"), ("Alle Dateien", "*.*")]
+AUDIO_TARGET_TYPES = [("MP3", "*.mp3")]
 
 
 class FileDialogs:
@@ -72,6 +73,14 @@ class FileDialogs:
         if kind == "pack":
             return filedialog.askopenfilename(title="Sound-Paket importieren",
                                               filetypes=PACK_TYPES) or None
+        if kind == "audio_target":
+            # Windows asks before overwriting an existing file (confirmoverwrite default)
+            return filedialog.asksaveasfilename(
+                title="Gekürzten Sound speichern",
+                initialfile=kwargs.get("default_name") or "Sound.mp3",
+                defaultextension=".mp3",
+                filetypes=AUDIO_TARGET_TYPES,
+            ) or None
         return filedialog.asksaveasfilename(
             title="Sound-Paket speichern",
             initialfile=kwargs.get("default_name") or "sounds.ruckuspack",
@@ -79,7 +88,7 @@ class FileDialogs:
             filetypes=[("Ruckus-Paket", "*.ruckuspack")],
         ) or None
 
-    # ---- the four questions the core asks ----
+    # ---- the questions the core asks ----
 
     def pick_sound_file(self):
         return self._ask("sound")
@@ -92,3 +101,6 @@ class FileDialogs:
 
     def ask_export_target(self, default_name: str):
         return self._ask("target", default_name=default_name)
+
+    def ask_audio_target(self, default_name: str):
+        return self._ask("audio_target", default_name=default_name)

@@ -55,6 +55,12 @@ WHATS_NEW = {
               "Lautstärke, auch aus der Browser-Ansicht. Braucht Spotify Premium und die "
               "geöffnete Spotify-App. Und: „Musik ins Mikrofon“ auf der Musik-Seite lässt "
               "deine Mitspieler mithören."),
+    "1.4.0": ("Neu: deine Spotify-Bibliothek in Ruckus – Playlists, Alben, Suche und „Gefällt "
+              "mir“; Lieblinge heftest du per Rechtsklick an die Seitenleiste. „Musik ins "
+              "Mikrofon“ überträgt nur noch Spotify und gleicht den Pegel selbst aus – den "
+              "Spotify-Regler stellst du nur für deine Ohren. Jedes Kabel hat einen Schalter "
+              "„Musik“, im Dock gibt es „Discord: Musik an/aus“. Außerdem: Musik klingt so laut "
+              "wie in Spotify, und „Kürzen…“ schneidet Sounds zu."),
 }
 
 

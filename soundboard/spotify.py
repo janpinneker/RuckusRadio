@@ -29,10 +29,16 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 log = logging.getLogger(__name__)
 
 CLIENT_ID_ENV = "RUCKUS_SPOTIFY_CLIENT_ID"
+# Spec §14.1 (E1=a): "Like" (user-library-modify, Task 8) and "Zuletzt gespielt"
+# (user-read-recently-played, this task) - requested together so one reconnect covers both.
+NEW_SCOPES = ("user-library-modify", "user-read-recently-played")
 SCOPES = ("user-read-private", "user-library-read",
           "playlist-read-private", "playlist-read-collaborative", "user-follow-read",
-          "user-read-playback-state", "user-modify-playback-state")
-SEARCH_KINDS = ("track", "album", "playlist", "artist")
+          "user-read-playback-state", "user-modify-playback-state", *NEW_SCOPES)
+SEARCH_KINDS = ("track", "album", "playlist", "artist", "all")
+# The `loading`/`_request_seq` sections (R1/R2): not Spotify's OAuth `SCOPES` above - these
+# are SpotifyService's own request sections, "login" included (see `login`/`logout`).
+_REQUEST_SCOPES = ("search", "library", "playlist", "recent", "login")
 # Spotify halved the maximum of GET /search to 10 in February 2026 (the default is 5).
 SEARCH_LIMIT = 10
 # Our own page size for the list endpoints (playlist items); Spotify does not cap these at 10.
@@ -120,6 +126,18 @@ class NoDevice(ApiError):
 REFUSED = "Spotify erlaubt das gerade nicht."
 
 
+class Forbidden(ApiError):
+    """A plain 403 with no known reason (not PREMIUM_REQUIRED/NO_ACTIVE_DEVICE).
+
+    Since February 2026 Spotify serves playlist content only for the user's own
+    playlists - live 2026-09-29 also 403 as co-author (spec §14.4); `_run_playlist` catches this one specifically and
+    turns it into the empty "kein Zugriff" state instead of an error. Still an `ApiError`
+    subclass, so callers that only catch `ApiError` see no change (Eng-Review brief).
+    """
+
+    text = REFUSED
+
+
 # ---- pure helpers (no network) ----
 
 def make_verifier() -> str:
@@ -142,6 +160,21 @@ def authorize_url(client_id: str, challenge: str, state: str, redirect: str) -> 
         "state": state,
         "scope": " ".join(SCOPES),
     })
+
+
+def missing_scopes(scope: str, required: tuple[str, ...] = NEW_SCOPES) -> tuple[str, ...]:
+    """Which of `required` a stored token's `scope` string does not name.
+
+    Only `NEW_SCOPES` matter here (spec §14.1, E1): an old token missing them is a hint
+    to reconnect, not a broken connection - search/library keep working on the scopes it
+    already has. Task 8 ("Like") reuses this for the same two scopes.
+    """
+    have = set((scope or "").split())
+    return tuple(s for s in required if s not in have)
+
+
+def has_scopes(scope: str, required: tuple[str, ...] = NEW_SCOPES) -> bool:
+    return not missing_scopes(scope, required)
 
 
 def callback_result(path: str) -> tuple[str | None, str]:
@@ -217,6 +250,17 @@ def list_entry(entry: dict) -> dict | None:
     return None
 
 
+def _library_track(entry: dict) -> dict | None:
+    """One `/me/tracks` page entry, same shape `_library_loaded` reads for the first page."""
+    track = entry.get("track") if isinstance(entry, dict) else None
+    return map_track(track) if isinstance(track, dict) else None
+
+
+def _library_playlist(entry: dict) -> dict | None:
+    """One `/me/playlists` page entry - the playlist dict itself, no wrapper."""
+    return map_playlist(entry) if isinstance(entry, dict) else None
+
+
 def map_album(item: dict) -> dict:
     return {
         "id": str(item.get("id") or ""),
@@ -227,8 +271,27 @@ def map_album(item: dict) -> dict:
     }
 
 
+def _library_album(entry: dict) -> dict | None:
+    """One `/me/albums` page entry, same wrapper shape `_library_loaded` reads for the
+    first page (`entry["album"]`, spec §14.3, E5=b)."""
+    album = entry.get("album") if isinstance(entry, dict) else None
+    return map_album(album) if isinstance(album, dict) else None
+
+
+# `SpotifyLoadLibraryMore` (spec §14.3): endpoint + row mapper per known section. An
+# unknown section is discarded.
+_LIBRARY_SECTIONS = {
+    "tracks": ("/me/tracks", _library_track),
+    "playlists": ("/me/playlists", _library_playlist),
+    "albums": ("/me/albums", _library_album),
+}
+
+
 _MAPPERS = {"track": map_track, "album": map_album, "playlist": map_playlist}
 _GROUPS = {"track": "tracks", "album": "albums", "playlist": "playlists", "artist": "artists"}
+# The "Alle" chip (spec §14.2, E2=a): one `/search` call for these three types at once,
+# in the order the three group headings are shown ("Titel", "Alben", "Playlists").
+_ALL_SEARCH_TYPES = ("track", "album", "playlist")
 
 
 def search_items(payload: dict, kind: str) -> tuple[list[dict], bool]:
@@ -357,6 +420,11 @@ class SpotifyApi:
         # "redirect_uri mismatch"). Without it a failed sign-in is undiagnosable, so it
         # travels along as `detail` - for the log, never for the interface.
         detail = f"HTTP {exc.code}"
+        # the path says which call failed (hand check 2026-09-29: a bare 403 did not);
+        # only the path - the query may carry ids, the token is a header anyway
+        path = urlsplit(getattr(exc, "url", None) or "").path
+        if path:
+            detail = f"{detail} {path}"
         try:
             body = exc.read().decode("utf-8", "replace").strip()
         except Exception:  # noqa: BLE001 - a missing body must not hide the status
@@ -382,7 +450,7 @@ class SpotifyApi:
             if reason == "NO_ACTIVE_DEVICE":
                 raise NoDevice(detail=detail)
             if exc.code == 403:
-                raise ApiError(REFUSED, detail=detail)
+                raise Forbidden(detail=detail)
         if exc.code >= 500:
             raise NetworkError(f"Spotify antwortet nicht ({exc.code}).", detail=detail)
         raise ApiError(f"Spotify hat die Anfrage abgelehnt ({exc.code}).", detail=detail)
@@ -419,8 +487,16 @@ class SpotifyApi:
         stored = self._tokens.load()
         if not stored or not stored.get("refresh_token"):
             raise NotConnected()
-        answer = self._token_request({"grant_type": "refresh_token",
-                                      "refresh_token": stored["refresh_token"]})
+        try:
+            answer = self._token_request({"grant_type": "refresh_token",
+                                          "refresh_token": stored["refresh_token"]})
+        except ApiError as exc:
+            # a revoked or expired refresh token answers 400 invalid_grant (live
+            # 2026-09-29, app removed at spotify.com/account/apps): the login is over,
+            # like a 401 - not a refused request that the next try might get through
+            if "invalid_grant" in exc.detail:
+                raise AuthError(detail=exc.detail) from exc
+            raise
         self._remember(answer)
 
     def _remember(self, answer: dict) -> None:
@@ -431,7 +507,16 @@ class SpotifyApi:
             self._expires_at = time.monotonic() + expires - 60.0
         refresh = answer.get("refresh_token")
         if refresh:
-            self._tokens.save({"refresh_token": str(refresh), "scope": answer.get("scope", "")})
+            # R4 (eng review): a refresh answer may repeat the refresh_token without
+            # `scope` - Spotify does this - so a missing key keeps what was already
+            # stored instead of overwriting it with "" (which would falsely demand a
+            # reconnect on the next check).
+            if "scope" in answer:
+                scope = str(answer.get("scope") or "")
+            else:
+                stored = self._tokens.load()
+                scope = stored.get("scope", "") if stored else ""
+            self._tokens.save({"refresh_token": str(refresh), "scope": scope})
 
     def _ensure_token(self) -> None:
         if self._access and time.monotonic() < self._expires_at:
@@ -534,29 +619,49 @@ class SpotifyService:
     """The music tab's data: auth, search, library. Registers itself with the core."""
 
     def __init__(self, core, api=None, token_store=None):
-        from .protocol import (SpotifyLoadLibrary, SpotifyLoadPlaylist, SpotifyLogin,
-                               SpotifyLogout, SpotifySearch, SpotifySearchMore)
+        from .protocol import (SpotifyLoadAlbum, SpotifyLoadLibrary, SpotifyLoadPlaylist, SpotifyLogin,
+                               SpotifyLogout, SpotifySearch, SpotifySearchMore,
+                               SpotifyLoadLibraryMore, SpotifyLoadRecent)
         self._core = core
         self.tokens = token_store if token_store is not None else TokenStore(core.store)
         self.client_id = ""
         self._api = api
         self._pending: tuple[str, str] | None = None
+        # Each login and each logout moves this on: a worker's answer for an older login
+        # (the user logged out or started over meanwhile) is dropped, like R1 for sections.
+        self._login_seq = 0
         self._server = None  # the local server, via attach_server: it owns /callback
         self._listener: _CallbackListener | None = None
         self._last_notice: str | None = None
         self.connected = False
         self.user: dict | None = None
-        self.busy = False
-        self.error: str | None = None
+        self.error: str | None = None  # derived: the most recently set error text
         self.search: dict | None = None
         self.library: dict | None = None
         self.playlist: dict | None = None
+        self.recent: list[dict] | None = None  # SpotifyTrack[], spec §14.7
+        # Spotify names no play counts per playlist; `recently-played`'s `context` is the
+        # only approximation there is (Jan, hand check 2026-09-29) - counted fresh on every
+        # `_recent_loaded`, never persisted (spec §2.6), cleared on logout like `recent`.
+        self.playlist_plays: dict[str, int] = {}
+        # R1/R2 (eng review): `loading` names the sections currently in flight - "login" is
+        # one of them too (the simplest way to keep its own busy handling covered by the
+        # derived `busy` below, instead of a second flag). `errors` holds the latest text
+        # per section (`search`/`library`/`playlist`/`recent`); `_request_seq` counts each
+        # section's requests so a stale answer (an older request's success or failure,
+        # arriving after a newer one for the same section) is discarded, never applied.
+        self.loading: list[str] = []
+        self.errors: dict[str, str] = {}
+        self._request_seq: dict[str, int] = {}
         core.handle(SpotifyLogin, self.login)
         core.handle(SpotifyLogout, self.logout)
         core.handle(SpotifySearch, self.search_command)
         core.handle(SpotifySearchMore, self.search_command)
         core.handle(SpotifyLoadLibrary, self.load_library)
         core.handle(SpotifyLoadPlaylist, self.load_playlist)
+        core.handle(SpotifyLoadAlbum, self.load_album)
+        core.handle(SpotifyLoadLibraryMore, self.load_library_more)
+        core.handle(SpotifyLoadRecent, self.load_recent)
         core.add_state("spotify", self.snapshot)
         core.on_start(self._read_client_id)
         core.on_shutdown(self._close_listener)
@@ -570,7 +675,7 @@ class SpotifyService:
 
     def report(self, error: SpotifyError) -> None:  # core
         """Same handling as a failed search: an AuthError drops the login."""
-        self._failed(error)
+        self._failed(None, None, error)
 
     def _read_client_id(self) -> None:
         self.tokens.migrate_legacy()  # one-time, from the pre-secrets-store version
@@ -583,8 +688,11 @@ class SpotifyService:
     def snapshot(self) -> dict:
         """Never carries a token, the client id or a file path - the interface must not need them."""
         return {"configured": bool(self.client_id), "connected": self.connected,
-                "user": self.user, "busy": self.busy, "error": self.error,
-                "search": self.search, "library": self.library, "playlist": self.playlist}
+                "user": self.user, "busy": bool(self.loading), "error": self.error,
+                "search": self.search, "library": self.library, "playlist": self.playlist,
+                "recent": self.recent, "loading": list(self.loading), "errors": dict(self.errors),
+                "playlist_plays": dict(self.playlist_plays),
+                "needs_reconnect": self._needs_reconnect()}
 
     # ---- auth ----
 
@@ -604,8 +712,8 @@ class SpotifyService:
         mismatch". Much better to name the cause here.
         """
         if self._server is None:
-            self._fail(SpotifyError("Die Spotify-Anmeldung braucht den lokalen Server - "
-                                    "starte die Web-Oberfläche (Standard) oder --serve."))
+            self._fail("login", SpotifyError("Die Spotify-Anmeldung braucht den lokalen Server - "
+                                          "starte die Web-Oberfläche (Standard) oder --serve."))
             return None
         try:
             wanted = int(self._core.store.data.get("server_port") or 0)
@@ -613,7 +721,7 @@ class SpotifyService:
             wanted = 0
         port = int(getattr(self._server, "port", 0) or 0)
         if wanted and port != wanted:
-            self._fail(SpotifyError(
+            self._fail("login", SpotifyError(
                 f"Die Oberfläche läuft auf Port {port}, die Spotify-Weiterleitung zeigt auf "
                 f"{wanted}. Schließ das Programm, das {wanted} belegt, und starte neu."))
             return None
@@ -621,7 +729,7 @@ class SpotifyService:
 
     def login(self, _cmd=None) -> None:
         if not self.client_id:
-            self._fail(NotConfigured())
+            self._fail("login", NotConfigured())
             return
         if self._pending is not None:
             return
@@ -636,77 +744,103 @@ class SpotifyService:
             self._listener = _CallbackListener(self._server, state)
         except ValueError as exc:  # the route is still taken: a login is running
             self._pending = None
-            self._fail(SpotifyError("Es läuft schon eine Spotify-Anmeldung."))
+            self._fail("login", SpotifyError("Es läuft schon eine Spotify-Anmeldung."))
             log.warning("spotify callback route busy: %s", exc)
             return
         import webbrowser
         webbrowser.open(authorize_url(self.client_id, challenge_of(verifier), state, uri))
-        self.busy = True
-        self.error = None
+        # "login" is a section of `loading` too (R2): the simplest way to keep its own
+        # busy handling covered by the derived `busy`, without a second flag.
+        self._start_loading("login")
+        # a new attempt makes the last login failure moot (`errors["login"]`, final review
+        # Minor 3); another section's error must stand
+        self.errors.pop("login", None)
+        self._recompute_error()
         self._core.state_changed()
-        self._core.workers.submit(self._await_callback)
+        self._login_seq += 1
+        self._core.workers.submit(self._await_callback, self._listener, self._login_seq)
 
-    def _await_callback(self) -> None:  # worker
-        assert self._listener is not None
+    def _await_callback(self, listener: "_CallbackListener", seq: int) -> None:  # worker
+        # the listener comes as an argument: a logout clears `self._listener` at any time
         try:
-            code, state = self._listener.wait(LOGIN_TIMEOUT_S)
+            code, state = listener.wait(LOGIN_TIMEOUT_S)
         except TimeoutError:
             self._core.executor.submit(self._login_failed,
-                                       "Zeitüberschreitung. Verbinde dich erneut.")
+                                       "Zeitüberschreitung. Verbinde dich erneut.", seq)
             return
         except SpotifyError as exc:
-            self._core.executor.submit(self._login_failed, exc)
+            self._core.executor.submit(self._login_failed, exc, seq)
             return
         except Exception as exc:  # noqa: BLE001 - never leave the login stuck
             log.exception("spotify callback wait failed")
-            self._core.executor.submit(self._login_failed, str(exc))
+            self._core.executor.submit(self._login_failed, str(exc), seq)
             return
-        if self._pending is None or state != self._pending[1]:
-            self._core.executor.submit(self._login_failed, "Die Antwort passte nicht zur Anfrage.")
+        if state != listener.expected_state:
+            self._core.executor.submit(self._login_failed, "Die Antwort passte nicht zur Anfrage.", seq)
             return
         try:
-            answer = self._api.exchange_code(code)
+            self._api.exchange_code(code)
+            if seq != self._login_seq:  # read only: a logout meanwhile - ask nothing more
+                self._core.executor.submit(self._logged_in, None, seq)
+                return
+            user = self._api.get_user()  # here, not on the core thread: no network there
         except SpotifyError as exc:
-            self._core.executor.submit(self._login_failed, exc)
+            self._core.executor.submit(self._login_failed, exc, seq)
             return
-        self._core.executor.submit(self._logged_in, answer)
+        self._core.executor.submit(self._logged_in, user, seq)
 
-    def _logged_in(self, answer: dict) -> None:  # core
+    def _logged_in(self, user: dict | None, seq: int | None = None) -> None:  # core
         from .protocol import SpotifyAuthChanged
+        if seq is not None and seq != self._login_seq:
+            # cancelled meanwhile (logout): SpotifyApi stored the refresh token during the
+            # exchange on the worker - it must not survive unless a newer login holds it
+            # (connected, or still running: its exchange may have stored its own token)
+            if not self.connected and self._pending is None:
+                self.tokens.clear()
+            return
         self._close_listener()
         self._pending = None
-        self.busy = False
-        try:
-            self._remember_user(self._api.get_user())
-        except SpotifyError as exc:
-            self._login_failed(exc)
-            return
+        self._stop_loading("login")
+        self._remember_user(user or {})
         self._core.emit(SpotifyAuthChanged(True, self.user["name"]))
         self._core.notice(f"Mit Spotify verbunden: {self.user['name']}", "info")
         self._core.state_changed()
         self.load_library()
+        if not self._needs_reconnect():  # a fresh login always grants both new scopes
+            self.load_recent()
 
-    def _login_failed(self, error) -> None:  # core
+    def _login_failed(self, error, seq: int | None = None) -> None:  # core
         """End the login. `error` is the SpotifyError that caused it, or a plain text.
 
         The raw cause is important here: a failed sign-in is the one case the user cannot
         reproduce on demand, so "unable to get local issuer certificate" or Spotify's
         "invalid_client" must reach the log instead of only "the login expired".
         """
+        if seq is not None and seq != self._login_seq:
+            return  # a login the user already left (logout, or a newer login)
         self._close_listener()
         self._pending = None
-        self.busy = False
+        self._stop_loading("login")
         detail = getattr(error, "detail", "")
         if detail:
             log.info("spotify login failed: %s", detail)
         text = error.text if isinstance(error, SpotifyError) else str(error)
-        self._fail(AuthError(text))
+        if not self.connected:
+            # the exchange may have stored a refresh token before a later step failed;
+            # without a connection none may survive (a restart would log in with it)
+            self.tokens.clear()
+        self._fail("login", AuthError(text))
 
-    def finish_login(self, refresh_token: str, user: dict) -> None:
-        """Programmatic hook (tests): mark connected without the browser round trip."""
+    def finish_login(self, refresh_token: str, user: dict, scope: str = "") -> None:
+        """Programmatic hook (tests): mark connected without the browser round trip.
+
+        `scope` defaults to every scope in `SCOPES` (a real OAuth login always grants what
+        it asked for) - tests that need an old token missing the new ones (spec §14.1)
+        pass a narrower string.
+        """
         self._close_listener()
         self._pending = None
-        self.tokens.save({"refresh_token": refresh_token})
+        self.tokens.save({"refresh_token": refresh_token, "scope": scope or " ".join(SCOPES)})
         self._remember_user(user)
         self.connected = True
         self._core.state_changed()
@@ -716,19 +850,37 @@ class SpotifyService:
         avatar = images[0].get("url") if images and isinstance(images[0], dict) else None
         self.user = {"name": str(user.get("display_name") or ""), "avatar_url": avatar}
         self.connected = True
-        self.error = None
+        # a fresh login makes every old section error moot ("login expired" above all);
+        # the sections reload anyway
+        self.errors = {}
+        self._recompute_error()
 
-    def logout(self, _cmd=None) -> None:
-        from .protocol import SpotifyAuthChanged
-        self._close_listener()
+    def _end_session(self) -> None:
+        """Drop the account's data and cut every section's generation (logout and an
+        expired login alike). A request started before (e.g. the auto `load_library()`
+        after a login) is still running on a worker and does not know the session ended -
+        its token must stop matching, or its answer (success or failure) would write
+        library/search/playlist/error back after the user is already gone."""
         self.tokens.clear()
         self.connected = False
         self.user = None
         self.search = None
         self.library = None
         self.playlist = None
-        self.busy = False
+        self.recent = None
+        self.playlist_plays = {}
+        self.loading = [s for s in self.loading if s == "login"]  # a running login goes on
+        for scope in _REQUEST_SCOPES:
+            self._request_seq[scope] = self._request_seq.get(scope, 0) + 1
+
+    def logout(self, _cmd=None) -> None:
+        from .protocol import SpotifyAuthChanged
+        self._close_listener()
+        self._end_session()
+        self.loading = []
+        self.errors = {}
         self.error = None
+        self._login_seq += 1  # a login still waiting or exchanging is dropped too
         self._core.emit(SpotifyAuthChanged(False))
         self._core.notice("Von Spotify getrennt.", "info")
         self._core.state_changed()
@@ -736,49 +888,72 @@ class SpotifyService:
     # ---- queries ----
 
     def search_command(self, cmd) -> None:
+        from .protocol import SpotifySearchMore
         query = cmd.query.strip()
         if not query:
             return  # the interface debounces; an empty search sends nothing
         kind = cmd.search_type if cmd.search_type in SEARCH_KINDS else DEFAULT_KIND
+        if kind == "all" and isinstance(cmd, SpotifySearchMore):
+            return  # "Mehr laden" does not exist for the "Alle" groups view (spec §14.2)
         if not self._ready():
             return
         offset = max(0, int(cmd.offset))
-        self.busy = True
-        self.error = None
+        token = self._start_request("search")
         self._core.state_changed()
-        self._core.workers.submit(self._run_search, query, kind, offset)
+        self._core.workers.submit(self._run_search, query, kind, offset, token)
 
-    def _run_search(self, query: str, kind: str, offset: int) -> None:  # worker
+    def _run_search(self, query: str, kind: str, offset: int, token: int) -> None:  # worker
+        if kind == "all":
+            # One call for all three types (spec §14.2); no `offset` - the groups view has
+            # no "Mehr laden", each group's "Alle zeigen" switches to the single-type chip.
+            params = {"q": query, "type": ",".join(_ALL_SEARCH_TYPES), "limit": SEARCH_LIMIT}
+            self._network(lambda: self._api.get("/search", params),
+                          lambda payload: self._searched_all(query, token, payload),
+                          "search", token)
+            return
         params = {"q": query, "type": kind, "limit": SEARCH_LIMIT, "offset": offset}
         self._network(lambda: self._api.get("/search", params),
-                      lambda payload: self._searched(query, kind, offset, payload))
+                      lambda payload: self._searched(query, kind, offset, token, payload),
+                      "search", token)
 
-    def _searched(self, query: str, kind: str, offset: int, payload: dict) -> None:  # core
+    def _searched(self, query: str, kind: str, offset: int, token: int, payload: dict) -> None:  # core
+        if not self._current("search", token):
+            return  # a stale answer (an older search) is discarded (R1)
         items, has_more = search_items(payload, kind)
         previous = self.search
         if previous and previous["query"] == query and previous["kind"] == kind and offset > 0:
             items = previous["items"] + items  # "mehr laden" appends to what is shown
         self.search = {"query": query, "kind": kind, "offset": offset + SEARCH_LIMIT,
-                       "has_more": has_more, "items": items}
-        self._done()
+                       "has_more": has_more, "items": items, "groups": None}
+        self._done("search")
+
+    def _searched_all(self, query: str, token: int, payload: dict) -> None:  # core
+        if not self._current("search", token):
+            return  # a stale answer (an older search) is discarded (R1)
+        groups = {kind: search_items(payload, kind)[0] for kind in _ALL_SEARCH_TYPES}
+        self.search = {"query": query, "kind": "all", "offset": 0, "has_more": False,
+                       "items": [], "groups": groups}
+        self._done("search")
 
     def load_library(self, _cmd=None) -> None:
         if not self._ready():
             return
-        self.busy = True
-        self.error = None
+        token = self._start_request("library")
         self._core.state_changed()
-        self._core.workers.submit(self._run_library)
+        self._core.workers.submit(self._run_library, token)
 
-    def _run_library(self) -> None:  # worker
+    def _run_library(self, token: int) -> None:  # worker
         def fetch() -> dict:
             return {"tracks": self._api.get("/me/tracks", {"limit": 50}),
                     "playlists": self._api.get("/me/playlists", {"limit": 50}),
                     "albums": self._api.get("/me/albums", {"limit": 50})}
 
-        self._network(fetch, self._library_loaded)
+        self._network(fetch, lambda payload: self._library_loaded(token, payload),
+                      "library", token)
 
-    def _library_loaded(self, payload: dict) -> None:  # core
+    def _library_loaded(self, token: int, payload: dict) -> None:  # core
+        if not self._current("library", token):
+            return
         tracks, playlists, albums = payload["tracks"], payload["playlists"], payload["albums"]
         self.library = {
             "tracks": [map_track(entry["track"]) for entry in tracks.get("items") or []
@@ -787,85 +962,290 @@ class SpotifyService:
                           if isinstance(entry, dict)],
             "albums": [map_album(entry["album"]) for entry in albums.get("items") or []
                        if isinstance(entry.get("album"), dict)],
+            "tracks_has_more": bool(tracks.get("next")),
+            "playlists_has_more": bool(playlists.get("next")),
             "albums_has_more": bool(albums.get("next")),
         }
-        self._done()
+        self._done("library")
+
+    def load_library_more(self, cmd) -> None:
+        """The next page of one library section ("mehr laden", spec §14.3).
+
+        Muster `_playlist_loaded`: the page is appended to what is already shown. An
+        unknown `section` is discarded, and so is a request before the library was ever
+        loaded (nothing to append to) - neither reaches the network.
+        """
+        section = cmd.section
+        if section not in _LIBRARY_SECTIONS:
+            return
+        if self.library is None:
+            return
+        if not self._ready():
+            return
+        offset = max(0, int(cmd.offset))
+        token = self._start_request("library")
+        self._core.state_changed()
+        self._core.workers.submit(self._run_library_more, section, offset, token)
+
+    def _run_library_more(self, section: str, offset: int, token: int) -> None:  # worker
+        path, _map_entry = _LIBRARY_SECTIONS[section]
+        self._network(lambda: self._api.get(path, {"limit": 50, "offset": offset}),
+                      lambda payload: self._library_more_loaded(section, token, payload),
+                      "library", token)
+
+    def _library_more_loaded(self, section: str, token: int, payload: dict) -> None:  # core
+        if not self._current("library", token):
+            return  # a stale answer (an older page for this or another section) is discarded (R1)
+        if self.library is None:
+            return  # the library was cleared (e.g. logout) while this was in flight
+        _path, map_entry = _LIBRARY_SECTIONS[section]
+        items = []
+        for entry in payload.get("items") or []:
+            item = map_entry(entry)
+            if item is not None:
+                items.append(item)
+        self.library = dict(self.library)
+        self.library[section] = self.library[section] + items
+        self.library[f"{section}_has_more"] = bool(payload.get("next"))
+        self._done("library")
+
+    def load_recent(self, _cmd=None) -> None:
+        """`SpotifyLoadRecent` (spec §14.7): loaded together with the library, both after
+        login and whenever the interface asks to load the library again. Skipped without a
+        network call while `needs_reconnect` stands (spec §14.1) - a hint, not an error."""
+        if not self._ready():
+            return
+        if self._needs_reconnect():
+            return
+        token = self._start_request("recent")
+        self._core.state_changed()
+        self._core.workers.submit(self._run_recent, token)
+
+    def _run_recent(self, token: int) -> None:  # worker
+        self._network(lambda: self._api.get("/me/player/recently-played", {"limit": 50}),
+                      lambda payload: self._recent_loaded(token, payload),
+                      "recent", token)
+
+    def _recent_loaded(self, token: int, payload: dict) -> None:  # core
+        if not self._current("recent", token):
+            return  # a stale answer (an older recent load) is discarded (R1)
+        items: list[dict] = []
+        plays: dict[str, int] = {}
+        for entry in payload.get("items") or []:
+            context = entry.get("context") if isinstance(entry, dict) else None
+            if isinstance(context, dict) and context.get("type") == "playlist":
+                # counted over every one of the (up to 50) entries, *before* the directly-
+                # consecutive-repeat collapse below - a played-three-times-in-a-row track
+                # must still count as three plays of its playlist (Jan, 2026-09-29).
+                uri = str(context.get("uri") or "")
+                if uri:
+                    plays[uri] = plays.get(uri, 0) + 1
+            track = entry.get("track") if isinstance(entry, dict) else None
+            if not isinstance(track, dict):
+                continue
+            mapped = map_track(track)
+            if items and mapped["id"] and items[-1]["id"] == mapped["id"]:
+                continue  # only *directly* consecutive repeats collapse (spec §14.7)
+            items.append(mapped)
+        self.recent = items
+        self.playlist_plays = plays
+        self._done("recent")
+
+    def _needs_reconnect(self) -> bool:
+        """Spec §14.1 (E1): a stored token whose `scope` does not name both new scopes is
+        a hint to reconnect once, not an error - Task 8 ("Like") reads this too."""
+        if not self.connected:
+            return False
+        stored = self.tokens.load()
+        return stored is not None and not has_scopes(stored.get("scope") or "")
 
     def load_playlist(self, cmd) -> None:
         if not self._ready():
             return
         offset = max(0, int(cmd.offset))
-        self.busy = True
-        self.error = None
+        token = self._start_request("playlist")
         self._core.state_changed()
-        self._core.workers.submit(self._run_playlist, cmd.playlist_id, offset)
+        self._core.workers.submit(self._run_playlist, cmd.playlist_id, offset, token)
 
-    def _run_playlist(self, playlist_id: str, offset: int) -> None:  # worker
+    def _run_playlist(self, playlist_id: str, offset: int, token: int) -> None:  # worker
         def fetch() -> dict:
-            return {"meta": self._api.get(f"/playlists/{playlist_id}", None),
-                    "page": self._api.get(f"/playlists/{playlist_id}/items",
-                                          {"limit": PAGE, "offset": offset}),
-                    "offset": offset}
+            # Since February 2026 Spotify answers a foreign playlist's meta and/or items
+            # with a plain 403 (spec §14.4) - caught here, per endpoint, so one Forbidden
+            # cannot hide whichever of the two still answered. `meta: None` and an empty
+            # page are the "no access" signal `_playlist_loaded` (core thread) reads below;
+            # any other error (network, 5xx, 429, 401) still propagates to `_network`.
+            try:
+                meta = self._api.get(f"/playlists/{playlist_id}", None)
+            except Forbidden as exc:
+                log.info("spotify playlist without access: %s", exc.detail)
+                meta = None
+            try:
+                page = self._api.get(f"/playlists/{playlist_id}/items",
+                                     {"limit": PAGE, "offset": offset})
+            except Forbidden as exc:
+                log.info("spotify playlist without access: %s", exc.detail)
+                page = {"items": [], "next": None}
+            return {"meta": meta, "page": page, "offset": offset, "playlist_id": playlist_id}
 
-        self._network(fetch, self._playlist_loaded)
+        self._network(fetch, lambda payload: self._playlist_loaded(token, payload),
+                      "playlist", token)
 
-    def _playlist_loaded(self, payload: dict) -> None:  # core
+    def _playlist_loaded(self, token: int, payload: dict) -> None:  # core
+        if not self._current("playlist", token):
+            return  # a stale answer (playlist A after B was opened) is discarded (R1)
         meta, page, offset = payload["meta"], payload["page"], payload["offset"]
+        playlist_id = payload["playlist_id"]
         items = []
         for entry in page.get("items") or []:
             track = list_entry(entry) if isinstance(entry, dict) else None
             if track is not None:
                 items.append(map_track(track))
+        if meta is None:
+            # 403 on /playlists/{id} itself (spec §14.4): the library, not the network, is
+            # the only source left for this playlist's name/cover/track_count - read here,
+            # on the core thread, never on the worker above.
+            found = None
+            if self.library:
+                found = next((pl for pl in self.library["playlists"] if pl["id"] == playlist_id),
+                             None)
+            mapped = dict(found) if found is not None else {
+                "id": playlist_id, "uri": f"spotify:playlist:{playlist_id}", "name": "",
+                "cover_url": None, "track_count": 0,
+            }
+        else:
+            mapped = map_playlist(meta)
         previous = self.playlist
-        if previous and previous["id"] == str(meta.get("id") or "") and offset > 0:
+        if previous and previous["id"] == mapped["id"] and offset > 0:
             items = previous["items"] + items
-        self.playlist = {"id": str(meta.get("id") or ""), "name": str(meta.get("name") or ""),
+        self.playlist = {"kind": "playlist", "id": mapped["id"], "name": mapped["name"],
+                         "uri": mapped["uri"], "cover_url": mapped["cover_url"],
+                         "track_count": mapped["track_count"],
                          "offset": offset + PAGE, "has_more": bool(page.get("next")),
                          "items": items}
-        self._done()
+        self._done("playlist")
+
+    # ---- album detail (E5 = a, live 2026-09-29: /albums/{id}/tracks answers) ----
+
+    def load_album(self, cmd) -> None:
+        if not self._ready():
+            return
+        offset = max(0, int(cmd.offset))
+        # one open detail at a time: the album shares the playlist's slot and counter (R1)
+        token = self._start_request("playlist")
+        self._core.state_changed()
+        self._core.workers.submit(self._run_album, cmd.album_id, offset, token)
+
+    def _run_album(self, album_id: str, offset: int, token: int) -> None:  # worker
+        def fetch() -> dict:
+            meta = self._api.get(f"/albums/{album_id}", None)
+            page = self._api.get(f"/albums/{album_id}/tracks", {"limit": PAGE, "offset": offset})
+            return {"meta": meta, "page": page, "offset": offset}
+
+        self._network(fetch, lambda payload: self._album_loaded(token, payload), "playlist", token)
+
+    def _album_loaded(self, token: int, payload: dict) -> None:  # core
+        if not self._current("playlist", token):
+            return  # a stale answer (another detail opened meanwhile) is discarded (R1)
+        meta, page, offset = payload["meta"], payload["page"], payload["offset"]
+        album = map_album(meta)
+        items = []
+        for entry in page.get("items") or []:
+            if isinstance(entry, dict) and entry.get("uri"):
+                track = map_track(entry)
+                # album tracks come without `album`: the album itself names and covers them
+                track["album"] = track["album"] or album["name"]
+                track["cover_url"] = track["cover_url"] or album["cover_url"]
+                items.append(track)
+        previous = self.playlist
+        if previous and previous.get("kind") == "album" and previous["id"] == album["id"] and offset > 0:
+            items = previous["items"] + items
+        self.playlist = {"kind": "album", "id": album["id"], "name": album["name"],
+                         "uri": album["uri"], "cover_url": album["cover_url"],
+                         "track_count": int(meta.get("total_tracks") or len(items)),
+                         "offset": offset + PAGE, "has_more": bool(page.get("next")),
+                         "items": items}
+        self._done("playlist")
 
     # ---- plumbing ----
 
     def _ready(self) -> bool:
         if not self.client_id:
-            self._fail(NotConfigured())
+            self._fail(None, NotConfigured())
             return False
         if not self.connected:
-            self._fail(NotConnected())
+            self._fail(None, NotConnected())
             return False
         return True
 
-    def _network(self, work, done) -> None:  # worker
+    def _start_loading(self, scope: str) -> None:
+        if scope not in self.loading:
+            self.loading.append(scope)
+
+    def _stop_loading(self, scope: str) -> None:
+        if scope in self.loading:
+            self.loading.remove(scope)
+
+    def _start_request(self, scope: str) -> int:
+        """Bump the section's request counter and mark it loading; returns the new token.
+
+        R1: the token travels with the worker call and its answer. `_current` below
+        tells whether that answer still belongs to the newest request for the section -
+        an older one (in flight when a newer one started) is discarded either way,
+        success or failure, once it arrives.
+        """
+        token = self._request_seq.get(scope, 0) + 1
+        self._request_seq[scope] = token
+        self._start_loading(scope)
+        return token
+
+    def _current(self, scope: str, token: int) -> bool:
+        return self._request_seq.get(scope) == token
+
+    def _network(self, work, done, scope: str, token: int) -> None:  # worker
         """Run `work` here; hand the payload or the error back to the core thread."""
         try:
             payload = work()
         except SpotifyError as exc:
-            self._core.executor.submit(self._failed, exc)
+            self._core.executor.submit(self._failed, scope, token, exc)
             return
         except Exception as exc:  # noqa: BLE001 - an unexpected error must not leave busy true
             log.exception("spotify request failed unexpectedly")
-            self._core.executor.submit(self._failed, NetworkError(str(exc)))
+            self._core.executor.submit(self._failed, scope, token, NetworkError(str(exc)))
             return
         self._core.executor.submit(done, payload)
 
-    def _done(self) -> None:  # core
-        self.busy = False
-        self.error = None
+    def _done(self, scope: str) -> None:  # core
+        self._stop_loading(scope)
+        self.errors.pop(scope, None)  # a success clears only its own section's error (R2)
+        self._recompute_error()
         self._last_notice = None
         self._core.state_changed()
 
-    def _failed(self, error: SpotifyError) -> None:  # core
+    def _failed(self, scope: str | None, token: int | None, error: SpotifyError) -> None:  # core
+        if scope is not None:
+            if not self._current(scope, token):
+                return  # a stale failure (an older request) is discarded too (R1)
+            self._stop_loading(scope)
         if isinstance(error, AuthError):
-            self.connected = False
-            self.user = None
-            self.tokens.clear()
+            self._end_session()  # like logout, but the errors stay readable
         if error.detail:  # the raw cause never reaches the interface, only the log
             log.info("spotify request failed: %s", error.detail)
-        self._fail(error)
+        self._fail(scope, error)
 
-    def _fail(self, error: SpotifyError) -> None:
+    def _recompute_error(self) -> None:
+        """The derived `error` (old readers): the latest of the remaining section errors,
+        or None once `errors` is empty. Kept simple on purpose (eng review R2) - an
+        unscoped error (e.g. "not connected") is overwritten the same way by the next
+        `_fail`, scoped or not."""
+        self.error = next(reversed(self.errors.values()), None)
+
+    def _fail(self, scope: str | None, error: SpotifyError) -> None:
         from .protocol import SpotifyError as SpotifyErrorEvent
-        self.busy = False
+        if scope is not None:
+            # pop before set: re-failing a section must move it to the end of `errors`,
+            # so `_recompute_error` (last value wins) picks the most recently set text.
+            self.errors.pop(scope, None)
+            self.errors[scope] = error.text
         self.error = error.text
         if error.text != self._last_notice:  # do not repeat the same line on every try
             self._last_notice = error.text

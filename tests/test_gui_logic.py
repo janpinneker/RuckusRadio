@@ -13,7 +13,11 @@ os.environ["RUCKUS_DATA_DIR"] = _TMP
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from soundboard import config, gui, layout, protocol as p, routing  # noqa: E402
+import tk_quiet  # noqa: E402
+
+tk_quiet.install()  # no test window may show up or take focus
+
+from soundboard import config, gui, layout, levels, protocol as p, routing  # noqa: E402
 import core_fakes  # noqa: E402
 
 MESSAGES: list[tuple[str, str]] = []
@@ -468,6 +472,47 @@ def test_volume_dialog_texts_preview_and_apply():
     print("volume dialog: dB texts, preview restarts, apply saves: OK")
 
 
+def test_tile_badge_follows_the_configured_klangbild_target():
+    """F4: the tile badge must read the configured Klangbild target for the sound's
+    category (from the core snapshot), not always the voice target - a music sound
+    with a custom target must show a different auto-dB than the voice target would."""
+    app, c, events = make_app()
+    sound = add_fixture_sound(app)
+    c.send(p.SetKlangbild({"music": -18.0}))  # first: the rebuild below must already see it
+    c.send(p.SetSoundCategory(sound["id"], "music"))  # triggers board.rebuild()
+    app.update_idletasks()
+    sound = next(s for s in app.sounds() if s["id"] == sound["id"])  # app.snapshot's own copy
+    assert sound["category"] == "music", sound
+    cfg = {"klangbild_targets": app.snapshot["devices"]["levels"]["targets"]}
+    assert cfg["klangbild_targets"]["music"] == -18.0, cfg
+    expected_badge = levels.loudness_badge(sound, cfg)
+    assert expected_badge != levels.loudness_badge(sound), "the fixture must actually differ"
+    tile = app.board.tiles[sound["id"]]
+    assert tile.level_label.cget("text") == expected_badge, tile.level_label.cget("text")
+    app.destroy()
+    print("tile badge follows the configured Klangbild target: OK")
+
+
+def test_tile_badge_updates_when_only_the_klangbild_target_changes():
+    """K1: SetSoundCategory rebuilds the board first (sounds JSON changed by the
+    category). A later SetKlangbild only changes state["devices"]["levels"]["targets"],
+    not state["sounds"] - the rebuild key must still notice, or the badge stays stale."""
+    app, c, events = make_app()
+    sound = add_fixture_sound(app)
+    c.send(p.SetSoundCategory(sound["id"], "music"))  # rebuilds once, sounds JSON changed
+    app.update_idletasks()
+    c.send(p.SetKlangbild({"music": -18.0}))  # only targets change now
+    app.update_idletasks()
+    sound = next(s for s in app.sounds() if s["id"] == sound["id"])
+    cfg = {"klangbild_targets": app.snapshot["devices"]["levels"]["targets"]}
+    assert cfg["klangbild_targets"]["music"] == -18.0, cfg
+    expected_badge = levels.loudness_badge(sound, cfg)
+    tile = app.board.tiles[sound["id"]]
+    assert tile.level_label.cget("text") == expected_badge, tile.level_label.cget("text")
+    app.destroy()
+    print("tile badge updates when only the klangbild target changes: OK")
+
+
 def test_settings_rows_from_the_snapshot_without_leaks():
     app, c, events = make_app()
     app.show_view("settings")
@@ -776,6 +821,8 @@ def main():
         test_missing_tile_blocks_hotkey_capture,
         test_tile_icon_missing_or_unreadable_falls_back,
         test_volume_dialog_texts_preview_and_apply,
+        test_tile_badge_follows_the_configured_klangbild_target,
+        test_tile_badge_updates_when_only_the_klangbild_target_changes,
         test_settings_rows_from_the_snapshot_without_leaks,
         test_output_row_and_mixer_panel_from_a_snapshot,
         test_build_app_starts_the_core_after_subscribing,

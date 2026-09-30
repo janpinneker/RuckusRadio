@@ -83,6 +83,13 @@ class SetSoundVolume(Command):
 
 
 @message
+class SetSoundCategory(Command):
+    """Klangbild K2: "effect" or "music" - the context menu next to the volume."""
+    sound_id: str
+    category: str
+
+
+@message
 class SetHotkey(Command):
     sound_id: str
     hotkey: str
@@ -148,6 +155,13 @@ class SetLevels(Command):
 
 
 @message
+class SetKlangbild(Command):
+    """Klangbild K3/K4, pattern SetLevels: any of {"effect": LUFS, "music": LUFS,
+    "music_offset_db": dB}."""
+    changes: dict
+
+
+@message
 class SetMicrophone(Command):
     name: str
     apply: bool = True  # False: only remember the choice (e.g. while onboarding_active)
@@ -165,6 +179,20 @@ class SetDiscordSounds(Command):
     """Sounds on/off for the cable Discord records from - the dock button. Its own
     command so the browser view may send it without SetOutput (levels, devices)."""
     on: bool
+
+
+@message
+class SetDiscordMusic(Command):
+    """Music on/off for the cable Discord records from - the dock button next to
+    "Discord: Sounds". PLAYBACK, so the browser view may send it too."""
+    on: bool
+
+
+@message
+class SetSidebarPins(Command):
+    """The whole list of entries the user pinned to the sidebar, in order (spec
+    spotify-bereich-seitenleiste D3). Every change sends the full new list."""
+    pins: tuple
 
 
 @message
@@ -286,6 +314,14 @@ class SpotifyLoadPlaylist(Command):
     offset: int = 0
 
 
+@message
+class SpotifyLoadAlbum(Command):
+    """Album detail (spec §14.1 E5 = a since 2026-09-29): shares the one open detail
+    (`spotify.playlist`, `kind: "album"`) with the playlist page."""
+    album_id: str
+    offset: int = 0
+
+
 # ---- Spotify F2: Wiedergabe (Spec §13.2). Alles PLAYBACK in access.py. ----
 
 @message
@@ -351,6 +387,64 @@ class SpotifyLoadDevices(Command):
     pass
 
 
+# ---- Spotify F3: Musik-Tab fertig (Spec §14). ----
+
+@message
+class SpotifyLoadLibraryMore(Command):
+    """The next page of one library section ("mehr laden")."""
+
+    section: str
+    offset: int
+
+
+@message
+class SpotifyLoadRecent(Command):
+    pass
+
+
+@message
+class SpotifySetSaved(Command):
+    uri: str
+    saved: bool
+
+
+# ---- C8 Kürzen (Spec 2026-09-28-c8-zuschnitt). Alles LIBRARY in access.py: der
+# Zuschnitt ändert die Bibliothek wie Umbenennen (Z7), die Ansicht bekommt ihn nicht.
+
+@message
+class LoadWaveform(Command):
+    """The editor asks for the waveform; the answer is WaveformLoaded, never state (Z2)."""
+    sound_id: str
+
+
+@message
+class PreviewTrim(Command):
+    """Hear start..end on the headphones only (Z3). Saves nothing."""
+    sound_id: str
+    start: float
+    end: float
+
+
+@message
+class SetSoundTrim(Command):
+    """Non-destructive cut in seconds (Z1): stored at the sound, applied when decoding."""
+    sound_id: str
+    start: float
+    end: float
+
+
+@message
+class ClearSoundTrim(Command):
+    sound_id: str
+
+
+@message
+class RequestExportTrimmed(Command):
+    """"Als neue Datei exportieren…": the core asks for the target (Windows dialog), the
+    page sends no path (spec §9). Exports the SAVED cut."""
+    sound_id: str
+
+
 # ---- events: core -> interface ----
 
 @message
@@ -398,6 +492,17 @@ class SoundMissing(Event):
 @message
 class SoundAdded(Event):
     sound_id: str
+
+
+@message
+class WaveformLoaded(Event):
+    """Answer to LoadWaveform: the whole file's length in seconds and min/max pairs of
+    the mono mix, flattened (min0, max0, min1, max1, ...). Not part of the state (Z2)."""
+    sound_id: str
+    duration: float
+    peaks: tuple[float, ...]
+    coalesce: ClassVar[bool] = True
+    coalesce_by: ClassVar[tuple[str, ...]] = ("sound_id",)
 
 
 @message

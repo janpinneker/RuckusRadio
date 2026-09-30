@@ -75,35 +75,55 @@ class PlaybackService:
             enumerate(sounds),
             key=lambda pair: (0 if pair[1].get("hotkey") else 1, -pair[1].get("plays", 0), pair[0]),
         )
-        jobs = [(s["id"], self._core.store.data_dir / s["file"])
+        jobs = [(s["id"], self._core.store.data_dir / s["file"], s.get("trim"))
                 for _index, s in ordered if s["id"] not in self._decoding]
-        for sound_id, _path in jobs:  # mark first: inline workers answer immediately
+        for sound_id, _path, _trim in jobs:  # mark first: inline workers answer immediately
             self._decoding.add(sound_id)
-        for sound_id, path in jobs:
-            self._core.workers.submit(self._decode, sound_id, path, True)
+        for sound_id, path, trim in jobs:
+            self._core.workers.submit(self._decode, sound_id, path, True, trim)
 
-    def _decode(self, sound_id: str, path: Path, up_front: bool = False) -> None:  # worker
+    def _decode(self, sound_id: str, path: Path, up_front: bool = False,
+               trim: dict | None = None) -> None:  # worker
         if up_front:
             try:
                 too_long = path.stat().st_size > LAZY_DECODE_BYTES
             except OSError:
                 too_long = False  # a missing file is reported by the decode below
             if too_long:
-                self._core.executor.submit(self._decoding.discard, sound_id)
+                self._core.executor.submit(self._skipped, sound_id)
                 return
         try:
-            self._core.engine.preload(sound_id, path)
+            self._core.engine.preload(sound_id, path, trim)
             ok = True
         except Exception:
             log.warning("decoding %s failed", path, exc_info=True)
             ok = False
-        self._core.executor.submit(self._decoded, sound_id, ok)
+        self._core.executor.submit(self._decoded, sound_id, ok, trim)
 
-    def _decoded(self, sound_id: str, ok: bool) -> None:  # core
+    def _skipped(self, sound_id: str) -> None:  # core
+        """The up-front decode was skipped (file too big for LAZY_DECODE_BYTES): unlike
+        _decoded, no decode ran and no answer is coming, so a Play that arrived while
+        this sound sat in the worker queue and got marked pending would otherwise be
+        lost forever. Replay it - it now takes the normal on-demand decode path."""
         self._decoding.discard(sound_id)
-        if config.find_sound(self._core.store.data, sound_id) is None:
+        pending = self._pending.pop(sound_id, None)
+        if pending is not None:
+            self.play(sound_id, *pending)
+
+    def _decoded(self, sound_id: str, ok: bool, trim: dict | None = None) -> None:  # core
+        self._decoding.discard(sound_id)
+        sound = config.find_sound(self._core.store.data, sound_id)
+        if sound is None:
             self._core.engine.forget(sound_id)  # deleted while decoding
             self._pending.pop(sound_id, None)
+            return
+        if ok and sound.get("trim") != trim:
+            # The trim changed while this decode ran (C8 reload): its samples are stale.
+            self._core.engine.forget(sound_id)
+            self._decoding.add(sound_id)
+            self._core.workers.submit(self._decode, sound_id,
+                                      self._core.store.data_dir / sound["file"], False,
+                                      sound.get("trim"))
             return
         changed = (sound_id in self.missing) == ok
         if ok:
@@ -134,39 +154,48 @@ class PlaybackService:
         sound = sounds[index]
         # second guard behind packs/VolumeDialog: config.json may be hand-edited
         volume = config.clamp_volume(sound.get("volume", 1.0) if volume is None else volume)
-        if not self._core.engine.is_loaded(sound_id):
+        # `sound_id in self._decoding` (not just `is_loaded`): a worker can write the
+        # engine cache (making is_loaded True) before the core thread runs _decoded to
+        # notice a trim change meanwhile and redo the decode - a real race between the
+        # worker and core threads. While `_decoding` still holds the sound, a decode for
+        # it has not resolved yet, so the cache cannot be trusted.
+        if sound_id in self._decoding or not self._core.engine.is_loaded(sound_id):
             self._pending[sound_id] = (volume, preview)
             if sound_id not in self._decoding:
                 self._decoding.add(sound_id)
                 self._core.workers.submit(self._decode, sound_id,
-                                          self._core.store.data_dir / sound["file"])
+                                          self._core.store.data_dir / sound["file"],
+                                          False, sound.get("trim"))
             return
-        gain = levels.play_gain(sound, volume)
+        gain = levels.play_gain(sound, volume, self._core.store.data)
+        music = levels.sound_category(sound) == "music"
         needle = needle_for_index(index, len(sounds))
         # a play token: (stop-all generation, per-sound stop counter) as they stood at
         # submit time - a later StopAll or Stop(sound_id) bumps one of them, so a stale
         # answer from the device thread is recognized and dropped in _started.
         token = (self._poll_gen, self._play_seq.get(sound_id, 0))
         self._core.devices.submit(self._play_on_device, sound_id, gain, needle,
-                                  time.monotonic(), token, preview)
+                                  time.monotonic(), token, preview, music)
 
     def _play_on_device(self, sound_id: str, gain: float, needle: float,
                         queued_at: float, token: tuple[int, int],
-                        preview: bool = False) -> None:  # device thread
+                        preview: bool = False, music: bool = False) -> None:  # device thread
         if time.monotonic() - queued_at > MAX_PLAY_WAIT_S:
             self._core.executor.submit(self._core.notice, PLAY_DROPPED, "hint")
             return
         try:
             if preview:
-                self._core.engine.play(sound_id, volume=gain, monitor_only=True)
+                started = self._core.engine.play(sound_id, volume=gain, monitor_only=True, music=music)
             else:
-                self._core.engine.play(sound_id, volume=gain)
+                started = self._core.engine.play(sound_id, volume=gain, music=music)
         except KeyError:
             return  # forgotten between is_loaded and play (deleted)
         except Exception:
             log.exception("playback of %s failed", sound_id)
             self._core.executor.submit(self._core.notice, PLAY_FAILED, "hint")
             return
+        if started is None:
+            return  # K6: no headphone, no mixer/VoiceMeeter - nothing started, stay silent
         self._core.executor.submit(self._started, sound_id, needle, token, preview)
 
     def _started(self, sound_id: str, needle: float, token: tuple[int, int],
@@ -218,6 +247,45 @@ class PlaybackService:
             self._core.executor.call_later(POLL_S, self._request_poll, gen)
         else:
             self._polling = False
+
+    # ---- trim (C8) ----
+
+    def reload(self, sound_id: str) -> None:
+        """The sound's trim changed: drop the decoded audio and decode it again with the
+        new cut. A decode already running notices the change itself in _decoded."""
+        sound = config.find_sound(self._core.store.data, sound_id)
+        if sound is None:
+            return
+        self._core.engine.forget(sound_id)
+        if sound_id in self._decoding:
+            return
+        self.preload([sound])
+
+    def play_clip(self, sound_id: str, samples) -> None:
+        """Trim preview (Z3): exactly `samples`, only on the headphones, at the sound's
+        own volume and normalization. A preview: no `plays`, no use window."""
+        sounds = self._sounds()
+        index = next((i for i, s in enumerate(sounds) if s["id"] == sound_id), None)
+        if index is None:
+            return
+        sound = sounds[index]
+        gain = levels.play_gain(sound, config.clamp_volume(sound.get("volume", 1.0)),
+                                self._core.store.data)
+        needle = needle_for_index(index, len(sounds))
+        token = (self._poll_gen, self._play_seq.get(sound_id, 0))
+        self._core.devices.submit(self._clip_on_device, sound_id, samples, gain, needle, token)
+
+    def _clip_on_device(self, sound_id: str, samples, gain: float, needle: float,
+                        token: tuple[int, int]) -> None:  # device thread
+        try:
+            started = self._core.engine.play_clip(sound_id, samples, gain)
+        except Exception:
+            log.exception("trim preview of %s failed", sound_id)
+            self._core.executor.submit(self._core.notice, PLAY_FAILED, "hint")
+            return
+        if started is None:
+            return  # K6: no headphone, no mixer - nothing started, no PlaybackStarted
+        self._core.executor.submit(self._started, sound_id, needle, token, True)
 
     # ---- stopping ----
 

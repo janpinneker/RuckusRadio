@@ -62,7 +62,7 @@ def test_outputs_and_levels_reach_the_mixer():
     sink = backend.sinks[0]
     c.send(p.SetOutput(CABLE, {"mic": False}))
     assert sink.applied[-1] == (CABLE, {"mic": False, "mic_gain": 1.0,
-                                        "sounds": True, "sounds_gain": 1.0})
+                                        "sounds": True, "sounds_gain": 1.0, "music": True})
     assert on_disk()["outputs"][CABLE]["mic"] is False, "a switch is saved at once"
     c.send(p.SetOutput(CABLE, {"sounds_gain": 0.5}))
     assert on_disk()["outputs"][CABLE]["sounds_gain"] == 1.0, "a slider waits for the debounce"
@@ -411,10 +411,56 @@ def test_discord_sounds_switch_the_cable_discord_records_from():
     print("Discord: Sounds switches exactly Discord's cable: OK")
 
 
+def test_discord_music_switches_only_the_music_of_discords_cable():
+    """Spec audio-routing D1: Discord per Knopf ohne Musik, Sounds bleiben unberuehrt."""
+    c, _events, backend = setup(start=False)
+    backend.resolved["virtual_mics"].append(
+        {"key": HIFI, "label": "Hi-Fi Cable", "out_index": 31, "in_index": 41,
+         "out_name": "Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)", "in_name": HIFI})
+    c.start()
+    sink = backend.sinks[0]
+    c.send(p.SetDiscordOutput(HIFI))
+    c.send(p.SetDiscordMusic(False))
+    assert sink.applied[-1][0] == HIFI
+    assert sink.applied[-1][1]["music"] is False and sink.applied[-1][1]["sounds"] is True
+    assert on_disk()["outputs"][HIFI]["music"] is False, "sofort gespeichert wie der Schalter"
+    assert "music" not in (on_disk()["outputs"].get(CABLE) or {}) or \
+        on_disk()["outputs"][CABLE]["music"] is True, "nur Discords Kabel"
+    c.send(p.SetDiscordMusic(True))
+    assert on_disk()["outputs"][HIFI]["music"] is True
+    print("Discord: Musik switches exactly the music of Discord's cable: OK")
+
+
+def test_klangbild_reaches_the_mixer_the_state_and_the_disk():
+    """Klangbild K3-K5, Muster SetLevels: Mischpult sofort, Speichern entprellt, Zustand
+    fuer die Seite; Unsinn wird geklemmt oder ignoriert."""
+    c, events, backend = setup()
+    sink = backend.sinks[0]
+    c.send(p.SetKlangbild({"music": -12.0, "music_offset_db": -9.0}))
+    assert sink.klangbild[-1] == (-9.0, 2.0), sink.klangbild
+    assert sink.levels[-1] == (-6.0, True, -6.0), "die bestehenden Pegel reisen mit"
+    lv = c.state()["devices"]["levels"]
+    assert lv["targets"] == {"effect": -20.0, "music": -12.0}, lv
+    assert lv["music_offset_db"] == -9.0
+    c.executor.advance(store.SAVE_DEBOUNCE_S)
+    assert on_disk()["klangbild_targets"] == {"effect": -20.0, "music": -12.0}
+    assert on_disk()["music_offset_db"] == -9.0
+    c.send(p.SetKlangbild({"effect": -99, "voice": -5, "music_offset_db": "laut"}))
+    lv = c.state()["devices"]["levels"]
+    assert lv["targets"] == {"effect": -24.0, "music": -12.0}, lv
+    assert lv["music_offset_db"] == -3.0, "Unsinn = Standard"
+    assert "voice" not in c.store.data["klangbild_targets"]
+    c.send(p.SetLevels({"sounds_offset_db": -9.0}))
+    assert sink.klangbild[-1] == (-3.0, 2.0), "SetLevels schickt den Musik-Abstand mit"
+    print("Klangbild reaches the mixer, the state and the disk: OK")
+
+
 def main():
     test_discord_sounds_switch_the_cable_discord_records_from()
+    test_discord_music_switches_only_the_music_of_discords_cable()
     test_start_builds_the_mixer_and_describes_it()
     test_outputs_and_levels_reach_the_mixer()
+    test_klangbild_reaches_the_mixer_the_state_and_the_disk()
     test_toggle_mic_mute()
     test_rescan_rebuilds_only_when_idle_and_keeps_the_mute()
     test_set_microphone_success_failure_and_busy()

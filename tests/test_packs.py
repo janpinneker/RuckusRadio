@@ -378,6 +378,68 @@ def test_import_icon_saved_at_icon_size():
     print("imported icon cropped to ICON_SIZE circle: OK")
 
 
+def test_the_trim_travels_with_the_pack():
+    src_dir = new_data_dir()
+    src_config = blank_config()
+    cut = make_sound(src_dir, src_config, "Kurz")
+    cut["trim"] = {"start": 0.5, "end": 1.5}
+    plain = make_sound(src_dir, src_config, "Lang")
+    zip_path = Path(tempfile.mkdtemp()) / "zwei.ruckuspack"
+    export_pack(src_config, src_dir, [cut["id"], plain["id"]], zip_path)
+    first, second = import_pack(zip_path, set(), new_data_dir())
+    assert first["trim"] == {"start": 0.5, "end": 1.5}
+    assert "trim" not in second
+
+    foreign = Path(tempfile.mkdtemp()) / "fremd.ruckuspack"
+    with zipfile.ZipFile(foreign, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"format": "ruckuspack", "version": 1,
+                                                 "sounds": ["a"]}))
+        zf.writestr("a/meta.json", json.dumps({"name": "Fremd", "volume": 1.0,
+                                               "audio": "sound.mp3",
+                                               "trim": {"start": "x", "end": 1}}))
+        zf.write(FIXTURES / "test_tone.mp3", "a/sound.mp3")
+    [imported] = import_pack(foreign, set(), new_data_dir())
+    assert "trim" not in imported, "ein kaputter Zuschnitt wird verworfen"
+    print("trim reist im Pack mit, kaputte Werte fallen weg: OK")
+
+
+def test_the_category_travels_with_the_pack():
+    """F5: eine gesetzte Kategorie reist im Pack mit (meta.json "category"), eine nicht
+    gesetzte erzeugt keinen Schluessel, und ein fremder/kaputter Wert wird beim Import
+    verworfen (nur soundboard.levels.CATEGORIES wird uebernommen)."""
+    from soundboard import levels
+
+    src_dir = new_data_dir()
+    src_config = blank_config()
+    music = make_sound(src_dir, src_config, "Song")
+    music["category"] = "music"
+    plain = make_sound(src_dir, src_config, "Ohne Kategorie")
+    zip_path = Path(tempfile.mkdtemp()) / "kategorie.ruckuspack"
+    export_pack(src_config, src_dir, [music["id"], plain["id"]], zip_path)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        manifest = json.loads(zf.read("manifest.json"))
+        metas = {folder: json.loads(zf.read(f"{folder}/meta.json")) for folder in manifest["sounds"]}
+    assert any(m.get("category") == "music" for m in metas.values())
+    assert any("category" not in m for m in metas.values())
+
+    first, second = import_pack(zip_path, set(), new_data_dir())
+    assert first["category"] == "music"
+    assert "category" not in second
+
+    foreign = Path(tempfile.mkdtemp()) / "fremde_kategorie.ruckuspack"
+    with zipfile.ZipFile(foreign, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"format": "ruckuspack", "version": 1,
+                                                 "sounds": ["a"]}))
+        zf.writestr("a/meta.json", json.dumps({"name": "Fremd", "volume": 1.0,
+                                               "audio": "sound.mp3", "category": "voice"}))
+        zf.write(FIXTURES / "test_tone.mp3", "a/sound.mp3")
+    [imported] = import_pack(foreign, set(), new_data_dir())
+    assert "category" not in imported, "eine unbekannte Kategorie wird verworfen"
+    assert levels.CATEGORIES == ("effect", "music")
+    print("Kategorie reist im Pack mit, fremde Werte fallen weg: OK")
+
+
 def test_export_missing_audio_removes_partial_pack():
     src_dir = new_data_dir()
     src_config = blank_config()
@@ -401,6 +463,8 @@ if __name__ == "__main__":
     test_import_icon_saved_at_icon_size()
     test_export_missing_audio_removes_partial_pack()
     test_round_trip_export_import()
+    test_the_trim_travels_with_the_pack()
+    test_the_category_travels_with_the_pack()
     test_import_pack_does_not_mutate_config_data_or_snapshot()
     test_import_name_collision_gets_suffix()
     test_import_dedups_multiple_new_sounds_against_each_other()

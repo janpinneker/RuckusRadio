@@ -113,6 +113,10 @@ class Target:
         self.mic_gain = float(settings["mic_gain"])
         self.sounds = bool(settings["sounds"])
         self.sounds_gain = float(settings["sounds_gain"])
+        # .get(..., False) is defensive only: config.output_settings always supplies
+        # `music` (a missing key there means True for cables, forced False for the
+        # monitor) - this never actually falls back in production.
+        self.music = bool(settings.get("music", False)) and key != MONITOR_KEY
         self.dropped_blocks = 0  # drift: mic ran ahead of this target's clock
         self.starved_blocks = 0  # drift: mic ran behind, silence inserted
         self.open_failed = False
@@ -126,6 +130,14 @@ class Target:
         # mic-enabled target's output callback keeps calling get_nowait() on a queue
         # that nothing refills, inflating starved_blocks for as long as the mute lasts.
         self._mic_muted = False
+        # Set by the group (SinkGroup.set_music_enabled/sinkgroup.build): the Musik-Bus
+        # only ever pushes blocks while it runs, so the `music` switch alone must not
+        # hold a device open (Final-Fix F2) - without a running bus a music-only cable
+        # would otherwise occupy PortAudio for nothing.
+        # Review Minor M4: this means "the music bus is switched ON", not "it is
+        # currently capturing" - a music-only cable stays open the whole time the bus
+        # is waiting for Spotify too (it just plays silence until Spotify attaches).
+        self._music_wanted = False
         self._mic_queue: queue.Queue = queue.Queue(maxsize=MIC_QUEUE_BLOCKS)
         # Musik-Bus (Spec "musik-bus-kern" §4): eigene Queue wie beim Mikrofon,
         # abgelegt wird in den Sound-Zweig (chunks), damit Offset/Ducking/Limiter
@@ -139,6 +151,13 @@ class Target:
         # behaelt 1.0 und keinen Ducker: "Sounds unter Stimme" und Ducking gelten fuer
         # das, was andere hoeren, nicht fuer das eigene Mithoeren.
         self.sounds_offset = 1.0
+        # Klangbild (K4/K5), also set by SinkGroup.apply_levels: music (tiles and the
+        # music bus) sits under the voice by its own offset, and the bus gets a fixed
+        # compensation on top of its own gain. The headphones keep 1.0.
+        self.music_offset = 1.0
+        self.musicbus_trim = 1.0
+        # Sources that are music. Same lock as _sources; MixSource hashes by identity.
+        self._music_sources: set[MixSource] = set()
         self.ducker: dynamics.Ducker | None = None
         self.limiter = dynamics.Limiter(ceiling_db=SOUND_CEILING_DB,
                                         samplerate=TARGET_SAMPLERATE)
@@ -148,8 +167,10 @@ class Target:
 
     @property
     def wants_stream(self) -> bool:
-        """Nothing switched on means nothing to send: keep the device free."""
-        return self.mic or self.sounds
+        """Nothing switched on means nothing to send: keep the device free. Music only
+        counts while the bus is actually running (`_music_wanted`, Final-Fix F2) - the
+        switch alone never pushes a block, so it must not hold a device open either."""
+        return self.mic or self.sounds or (self.music and self._music_wanted)
 
     @property
     def is_open(self) -> bool:
@@ -197,6 +218,20 @@ class Target:
         self.mic_gain = float(settings["mic_gain"])
         self.sounds = bool(settings["sounds"])
         self.sounds_gain = float(settings["sounds_gain"])
+        # .get(..., False): same defensive fallback as __init__, config.output_settings
+        # always supplies `music`.
+        was_music = self.music
+        new_music = bool(settings.get("music", False)) and self.key != MONITOR_KEY
+        if not was_music and new_music:
+            # Turning music ON: drain first, while self.music is still False, so a
+            # block the bus thread pushed in the race window between the previous
+            # apply()'s drain and its `self.music = False` (distribute_music read
+            # `music` as True a moment earlier and called push_music right after the
+            # drain) cannot survive into this now-enabled queue.
+            self._drain_music()
+        self.music = new_music
+        if not self.music:
+            self._drain_music()
         if not self.sounds:
             self.clear_sources()
         elif self.sounds_gain != old_gain and old_gain > 0:
@@ -211,14 +246,18 @@ class Target:
 
     # ---- sources ----
 
-    def add_source(self, samples: np.ndarray, gain: float) -> MixSource | None:
+    def add_source(self, samples: np.ndarray, gain: float,
+                   music: bool = False) -> MixSource | None:
         """This target's own MixSource over the SHARED sample array. None when the
-        target does not take sounds, so nothing is decoded or mixed for nothing."""
+        target does not take sounds, so nothing is decoded or mixed for nothing.
+        `music`: mixed under the voice by the music offset instead of the sounds one."""
         if not self.sounds:
             return None
         source = MixSource(samples, gain * self.sounds_gain)
         with self._lock:
             self._sources.append(source)
+            if music:
+                self._music_sources.add(source)
         return source
 
     def remove(self, source: MixSource | None) -> None:
@@ -228,11 +267,13 @@ class Target:
         with self._lock:
             if source in self._sources:
                 self._sources.remove(source)
+            self._music_sources.discard(source)
         source.finished.set()
 
     def clear_sources(self) -> None:
         with self._lock:
             sources, self._sources = self._sources, []
+            self._music_sources = set()
         for source in sources:
             source.stop()
             source.finished.set()
@@ -258,7 +299,12 @@ class Target:
     # ---- music (music bus thread) ----
 
     def push_music(self, block: np.ndarray) -> None:
-        """Called from SinkGroup.distribute_music, once per sounds-enabled target."""
+        """Called from SinkGroup.distribute_music, once per music-enabled cable
+        (never the headphones)."""
+        if not self.music:
+            # Belt: distribute_music read `music` as True a moment ago (race with
+            # apply() switching it off between then and now) - drop instead of queuing.
+            return
         try:
             self._music_queue.put_nowait(block)
         except queue.Full:
@@ -269,6 +315,14 @@ class Target:
             except (queue.Empty, queue.Full):
                 pass
             self.dropped_music += 1
+
+    def _drain_music(self) -> None:
+        """Music switched off: blocks already queued must not play later."""
+        while True:
+            try:
+                self._music_queue.get_nowait()
+            except queue.Empty:
+                return
 
     # ---- callback (PortAudio thread) ----
 
@@ -282,23 +336,30 @@ class Target:
 
         with self._lock:
             sources = list(self._sources)
+            music_sources = set(self._music_sources) if self._music_sources else ()
         done: list[MixSource] = []
         chunks: list[np.ndarray] = []
+        music_chunks: list[np.ndarray] = []
         for source in sources:
             chunk = source.pull(frames)
             if chunk is None:
                 done.append(source)
+            elif source in music_sources:
+                music_chunks.append(chunk)
             else:
                 chunks.append(chunk)
         if done:
             with self._lock:
                 self._sources = [s for s in self._sources if s not in done]
+                self._music_sources.difference_update(done)
 
-        # Musik-Bus: genau ein Block pro Callback, in den Sound-Zweig (chunks) -
-        # mit dem Ziel-Gain wie jeder Sound, dann wirken Offset/Ducking/Limiter.
-        if self.sounds:
+        # Musik-Bus: genau ein Block pro Callback, in den Musik-Teil des Sound-Zweigs -
+        # eigener Schalter `music`, Pegel folgt `sounds_gain` und dem festen
+        # Klangbild-Ausgleich, dann wirken Musik-Abstand/Ducking/Limiter.
+        if self.music:
             try:
-                chunks.append(self._music_queue.get_nowait() * self.sounds_gain)
+                music_chunks.append(self._music_queue.get_nowait()
+                                    * (self.sounds_gain * self.musicbus_trim))
             except queue.Empty:
                 pass
 
@@ -306,8 +367,10 @@ class Target:
         # is already ducked in its first block.
         ducker = self.ducker
         duck = ducker.next_ramp(self.voice.speaking, frames) if ducker is not None else None
-        if chunks:
+        if chunks or music_chunks:
             bus = _sum_blocks(chunks, frames) * np.float32(self.sounds_offset)
+            if music_chunks:
+                bus += _sum_blocks(music_chunks, frames) * np.float32(self.music_offset)
             if duck is not None:
                 bus = bus * duck
             blocks.append(self.limiter.process(bus))
@@ -414,14 +477,22 @@ class SinkGroup:
             target._mic_muted = self.mic_muted
 
     def apply_levels(self, offset_db: float, ducking_enabled: bool,
-                     ducking_db: float) -> None:
-        """"Sounds unter Stimme" und Ducking fuer alle Kabel; der Kopfhoerer bleibt neutral."""
+                     ducking_db: float, music_offset_db: float | None = None,
+                     musicbus_db: float = 0.0) -> None:
+        """"Sounds unter Stimme", "Musik unter Stimme", der feste Bus-Ausgleich
+        (Klangbild K4/K5) und Ducking fuer alle Kabel; der Kopfhoerer bleibt neutral.
+        `music_offset_db=None`: Musik wie Effekte (Aufrufer vor Klangbild)."""
+        music_db = offset_db if music_offset_db is None else music_offset_db
         for target in self.targets:
             if target.key == MONITOR_KEY:
                 target.sounds_offset = 1.0
+                target.music_offset = 1.0
+                target.musicbus_trim = 1.0
                 target.ducker = None
                 continue
             target.sounds_offset = dynamics.db_to_gain(offset_db)
+            target.music_offset = dynamics.db_to_gain(music_db)
+            target.musicbus_trim = dynamics.db_to_gain(musicbus_db)
             if target.ducker is None:
                 # Built and fully configured locally, published to target.ducker only
                 # once complete: dynamics.Ducker's constructor always starts `enabled =
@@ -438,11 +509,13 @@ class SinkGroup:
 
     # ---- sources ----
 
-    def add_source(self, samples: np.ndarray, gain: float, only: str | None = None) -> GroupSource:
+    def add_source(self, samples: np.ndarray, gain: float, only: str | None = None,
+                   music: bool = False) -> GroupSource:
         """`only`: the key of the one target that gets this sound (a preview goes to
-        the headphones alone); None = every target that takes sounds."""
+        the headphones alone); None = every target that takes sounds. `music`: the
+        Klangbild category, mixed with the music offset."""
         targets = [t for t in self.targets if only is None or t.key == only]
-        sources = [s for s in (t.add_source(samples, gain) for t in targets)
+        sources = [s for s in (t.add_source(samples, gain, music=music) for t in targets)
                    if s is not None]
         handle = GroupSource(sources)
         with self._handle_lock:
@@ -492,11 +565,11 @@ class SinkGroup:
             target.push_mic(block)
 
     def distribute_music(self, block: np.ndarray) -> None:
-        """Musik-Bus-Block an jedes Ziel, das Sounds hoert - Muster _distribute_mic,
-        eine Queue je Ziel, damit kein Ziel einem anderen Bloecke stiehlt. Laeuft
-        aus dem Abgriff-Faden des Musik-Buses auf."""
+        """Musik-Bus-Block an jedes Kabel mit Schalter `music` - nie an die Kopfhoerer
+        (Spec audio-routing-spotify, Praemisse 3). Muster _distribute_mic, eine Queue
+        je Ziel. Laeuft aus dem Abgriff-Faden des Musik-Buses auf."""
         for target in self.targets:
-            if target.sounds:
+            if target.music and target.key != MONITOR_KEY:
                 target.push_music(block)
 
     # ---- mic controls (compat with the dock's mic-mute button, predating the matrix) ----
@@ -505,6 +578,26 @@ class SinkGroup:
         self.mic_muted = bool(muted)
         for target in self.targets:
             target._mic_muted = self.mic_muted
+
+    # ---- music bus control (device thread, Final-Fix F2) ----
+
+    def set_music_enabled(self, on: bool) -> None:
+        """The bus started or stopped: a music-only cable must open/close with it,
+        exactly the way Target.apply() reacts to any other switch flipping
+        wants_stream. A cable that wants a stream anyway (mic/sounds) is untouched.
+
+        Review Minor M5: a target that is already open, or that already failed to
+        open (`open_failed`), does not get a fresh `open()` call on every toggle -
+        an already-open stream has nothing to do, and a broken device is not worth
+        retrying just because the bus flipped. Closing is unaffected."""
+        on = bool(on)
+        for target in self.targets:
+            target._music_wanted = on
+            if target.wants_stream:
+                if not target.is_open and not target.open_failed:
+                    target.open()
+            else:
+                target.close()
 
 
 def build(cfg: dict, resolved: dict, open_streams: bool = True) -> SinkGroup | None:
@@ -532,9 +625,18 @@ def build(cfg: dict, resolved: dict, open_streams: bool = True) -> SinkGroup | N
     if not targets:
         return None
 
+    # Final-Fix F2: the initial "does the bus already run" value must be in place
+    # BEFORE any stream opens, otherwise every music-only cable would open once
+    # here and then close again on the service's next attach_sink/set_music_enabled.
+    music_wanted = bool(cfg.get("musicbus_enabled"))
+    for target in targets:
+        target._music_wanted = music_wanted
+
     group = SinkGroup(targets, resolved.get("mic"))
     from . import levels
-    group.apply_levels(levels.sounds_offset_db(cfg), *levels.ducking(cfg))
+    group.apply_levels(levels.sounds_offset_db(cfg), *levels.ducking(cfg),
+                       music_offset_db=levels.music_offset_db(cfg),
+                       musicbus_db=levels.musicbus_compensation_db(cfg))
     if not open_streams:
         group._alive = True
         return group
@@ -545,6 +647,6 @@ def build(cfg: dict, resolved: dict, open_streams: bool = True) -> SinkGroup | N
         group.stop()
         return None
     log.info("sink group on %s, mic=%s active=%s",
-             [(t.key, t.mic, t.sounds) for t in group.targets],
+             [(t.key, t.mic, t.sounds, t.music) for t in group.targets],
              group.mic_device, group.mic_active)
     return group

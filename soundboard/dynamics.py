@@ -100,6 +100,60 @@ class Ducker:
         return ramp
 
 
+# Auto-Pegel for the music bus (Jan 2026-09-30): the process loopback hears Spotify after
+# its own volume slider, so turning Spotify down for his ears made it quiet on the cables
+# too. The bus now rides its own level back to "Spotify at 100 %" (about -14 LUFS, the
+# levels.SPOTIFY_REFERENCE_LUFS the Klangbild compensation assumes).
+MUSIC_REFERENCE_DB = -14.0
+MUSIC_MAX_BOOST_DB = 24.0
+MUSIC_MAX_CUT_DB = -6.0
+
+
+class MusicLeveler:
+    """Slow gain rider for music: measures the loudness over seconds (an exponential
+    mean of the power, so single drum hits or a quiet bridge do not pump), pulls it
+    toward target_db and holds the gain through pauses. Peaks stay with the limiter."""
+
+    def __init__(self, target_db: float = MUSIC_REFERENCE_DB, max_boost_db: float = MUSIC_MAX_BOOST_DB,
+                 max_cut_db: float = MUSIC_MAX_CUT_DB, gate_db: float = -60.0,
+                 window_s: float = 3.0, rise_db_per_s: float = 3.0, fall_db_per_s: float = 20.0,
+                 samplerate: int = 48000):
+        self.target_db = target_db
+        self.max_boost_db = max_boost_db
+        self.max_cut_db = max_cut_db
+        self.gate_db = gate_db
+        self.window_s = window_s
+        self.rise_db_per_s = rise_db_per_s
+        self.fall_db_per_s = fall_db_per_s
+        self.samplerate = samplerate
+        self.gain_db = 0.0
+        self._power: float | None = None  # running mean of the input power
+        self._applied = 1.0
+
+    def process(self, block: np.ndarray) -> np.ndarray:
+        frames = len(block)
+        if frames == 0:
+            return block.copy()
+        seconds = frames / self.samplerate
+        level = block_rms_db(block)
+        if level > self.gate_db:  # a pause (or Spotify stopped) holds everything
+            power = db_to_gain(level) ** 2
+            if self._power is None:
+                self._power = power
+            else:
+                self._power += (power - self._power) * min(1.0, seconds / self.window_s)
+            measured = gain_to_db(self._power ** 0.5)
+            desired = min(max(self.target_db - measured, self.max_cut_db), self.max_boost_db)
+            if desired > self.gain_db:
+                self.gain_db = min(desired, self.gain_db + self.rise_db_per_s * seconds)
+            else:
+                self.gain_db = max(desired, self.gain_db - self.fall_db_per_s * seconds)
+        new = db_to_gain(self.gain_db)
+        out = block * _ramp(self._applied, new, frames)
+        self._applied = new
+        return out
+
+
 class Leveler:
     """Slow gain rider for speech (a gentle compressor): pulls speech toward
     target_db RMS, holds its gain through pauses and lowers pauses by expander_db so

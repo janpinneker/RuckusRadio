@@ -404,6 +404,58 @@ def test_preview_plays_only_on_the_headphones():
     print("a preview plays only on the headphones: OK")
 
 
+class _MusicSink:
+    """Records whether the engine marks a play as music (Klangbild K4)."""
+
+    def __init__(self):
+        self.running = True
+        self.added = []
+
+    def add_source(self, samples, gain, only=None, music=False):
+        handle = type("H", (), {"finished": threading.Event()})()
+        self.added.append((gain, only, music))
+        return handle
+
+    def remove(self, handle):
+        pass
+
+
+def test_a_music_play_is_marked_for_the_sink():
+    sink = _MusicSink()
+    engine = AudioEngine(voicemeeter_device=1, monitor_device=10, monitor_volume=0.5, sink=sink)
+    engine._cache["s"] = DecodedSound(np.zeros((480, 2), dtype=np.float32), 48000)
+    engine.play("s", volume=0.7, music=True).stop()
+    engine.play("s", volume=0.7).stop()
+    engine.play("s", volume=0.7, monitor_only=True, music=True).stop()
+    assert sink.added == [(0.7, None, True), (0.7, None, False),
+                          (0.7, config.MONITOR_KEY, True)], sink.added
+    print("a music play is marked for the sink: OK")
+
+
+def test_play_clip_plays_only_the_given_frames_on_the_headphones():
+    FakeStream.created.clear()
+    engine = AudioEngine(voicemeeter_device=1, monitor_device=2, monitor_volume=0.5)
+    clip = np.full((300, 2), 0.4, dtype=np.float32)
+    engine.play_clip("a", clip, volume=1.0)
+    assert [s.device for s in FakeStream.created] == [2], "nur Kopfhoerer"
+    out = FakeStream.created[0].run_to_end(frames=256)
+    assert np.allclose(out[:300], 0.2) and np.allclose(out[300:], 0.0)
+    assert engine.playing_ids() == set()
+    sink = _CountingSink()
+    with_sink = AudioEngine(voicemeeter_device=1, monitor_device=10, monitor_volume=0.5, sink=sink)
+    with_sink.play_clip("s", clip, volume=0.7).stop()
+    assert sink.added == [(0.7, config.MONITOR_KEY)], sink.added
+    print("play_clip: genau diese Frames, nur Kopfhoerer: OK")
+
+
+def test_preload_applies_the_trim():
+    engine = AudioEngine(None, None)
+    fixture = Path(__file__).parent / "fixtures" / "test_tone.mp3"
+    engine.preload("t", fixture, {"start": 0.5, "end": 1.5})
+    assert len(engine._cache["t"].samples) == 48000
+    print("preload dekodiert mit Zuschnitt: OK")
+
+
 if __name__ == "__main__":
     audio.sd.OutputStream = FakeStream  # never open real devices here
     test_resolution()
@@ -420,4 +472,7 @@ if __name__ == "__main__":
     test_play_leaves_the_monitor_to_the_sink()
     test_play_still_uses_the_monitor_without_a_sink()
     test_preview_plays_only_on_the_headphones()
+    test_a_music_play_is_marked_for_the_sink()
+    test_play_clip_plays_only_the_given_frames_on_the_headphones()
+    test_preload_applies_the_trim()
     print("\nALL ENGINE LOGIC CHECKS PASSED")

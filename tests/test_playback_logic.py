@@ -12,6 +12,8 @@ os.environ["RUCKUS_DATA_DIR"] = _TMP
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import numpy as np  # noqa: E402
+
 from soundboard import config, dynamics, playback, protocol as p, store  # noqa: E402
 from soundboard.layout import needle_for_index  # noqa: E402
 import core_fakes  # noqa: E402
@@ -49,6 +51,22 @@ def test_play_uses_the_normalized_gain_and_reports_start():
     expected = 0.5 * dynamics.db_to_gain(6.0)
     assert abs(c2.engine.plays[0][1] - expected) < 1e-9, c2.engine.plays
     print("play applies volume x normalization and reports the start: OK")
+
+
+def test_music_sounds_use_the_music_target_and_are_marked():
+    """Klangbild K3: Musik auf -14 LUFS, Effekte weiter auf -20; der Mischer erfaehrt,
+    welche Wiedergabe Musik ist (eigener Abstand K4)."""
+    c, events, service = setup(integrated=-20.0)
+    c.store.data["sounds"][0]["category"] = "music"
+    c.send(p.Play("s0"))
+    c.send(p.Play("s1"))
+    assert abs(c.engine.plays[0][1] - dynamics.db_to_gain(6.0)) < 1e-9, c.engine.plays
+    assert abs(c.engine.plays[1][1] - 1.0) < 1e-9, c.engine.plays
+    assert c.engine.music_plays == ["s0"], c.engine.music_plays
+    c.store.data["klangbild_targets"] = {"effect": -20.0, "music": -16.0}
+    c.send(p.Play("s0"))
+    assert abs(c.engine.plays[2][1] - dynamics.db_to_gain(4.0)) < 1e-9, c.engine.plays
+    print("music sounds use the music target and are marked for the mixer: OK")
 
 
 def test_end_of_playback_is_polled_on_the_device():
@@ -94,6 +112,25 @@ def test_a_device_failure_becomes_a_hint():
     assert [n.text for n in core_fakes.of_type(events, p.Notice)] == [playback.PLAY_FAILED]
     assert service.playing == set()
     print("a failing device becomes a hint, nothing is marked playing: OK")
+
+
+def test_a_play_with_no_target_is_not_reported_as_playing():
+    """K6 follow-up: engine.play() returns None when there is no headphone/VoiceMeeter
+    device and no running sink/mixer - nothing actually started, so no PlaybackStarted,
+    no stuck 'playing' state and no play count, for a normal play and a preview alike."""
+    c, events, service = setup()
+    c.engine.no_target = True
+    sound = c.store.data["sounds"][0]
+    c.send(p.Play("s0"))
+    assert core_fakes.of_type(events, p.PlaybackStarted) == [], \
+        "nothing started - no PlaybackStarted"
+    assert service.playing == set() and c.engine.playing == set()
+    assert sound.get("plays", 0) == 0, "no play count for a play that reached no output"
+    c.send(p.Play("s1", preview=True))
+    assert core_fakes.of_type(events, p.PlaybackStarted) == [], \
+        "a preview with no target must not report a start either"
+    assert service.playing == set()
+    print("a play that reaches no output is not reported as playing: OK")
 
 
 def test_a_play_that_waited_too_long_is_dropped():
@@ -217,6 +254,97 @@ def test_started_ignores_a_play_stopped_by_a_single_stop():
     print("Stop(sound) before the device answered drops the stale PlaybackStarted: OK")
 
 
+def test_the_trim_travels_with_every_decode():
+    c, events, service = setup(loaded=False)
+    c.store.data["sounds"][0]["trim"] = {"start": 0.5, "end": 1.5}
+    service.preload(c.store.data["sounds"])
+    assert c.engine.trims == {"s0": {"start": 0.5, "end": 1.5}, "s1": None}, c.engine.trims
+    c2, _events2, _service2 = setup(loaded=False)
+    c2.store.data["sounds"][1]["trim"] = {"start": 0.1, "end": 0.9}
+    c2.send(p.Play("s1"))
+    assert c2.engine.trims["s1"] == {"start": 0.1, "end": 0.9}
+    print("der Zuschnitt reist mit jedem Dekodieren: OK")
+
+
+def test_reload_decodes_again_with_the_new_trim():
+    c, events, service = setup()
+    c.store.data["sounds"][0]["trim"] = {"start": 0.2, "end": 0.8}
+    service.reload("s0")
+    assert "s0" in c.engine.forgotten
+    assert c.engine.trims["s0"] == {"start": 0.2, "end": 0.8} and c.engine.is_loaded("s0")
+    service.reload("gone")  # unbekannt: nichts
+    print("reload dekodiert mit dem neuen Zuschnitt: OK")
+
+
+def test_a_decode_that_raced_a_trim_change_is_redone():
+    c, events, service = setup(loaded=False)
+    workers = core_fakes.QueuedWorkers()
+    c.workers = workers
+    service.preload(c.store.data["sounds"][:1])  # s0 ohne Zuschnitt in der Schlange
+    c.store.data["sounds"][0]["trim"] = {"start": 0.5, "end": 1.0}
+    service.reload("s0")
+    assert len(workers.jobs) == 1, "laeuft schon: kein zweiter Auftrag"
+    workers.run_all()
+    assert c.engine.preloads == ["s0", "s0"]
+    assert c.engine.trims["s0"] == {"start": 0.5, "end": 1.0}
+    assert "s0" not in service._decoding
+    print("ein veraltetes Dekodieren wird wiederholt: OK")
+
+
+def test_play_does_not_trust_a_cache_a_stale_decode_might_still_replace():
+    """Real race: a worker writes engine.preload()'s cache (marking it "loaded") before
+    the core thread runs _decoded() to notice the trim changed meanwhile and either
+    clears `_decoding` or redoes the decode. `play` must not trust `is_loaded` while
+    `_decoding` still holds the sound, or it could play the stale-trim samples an
+    in-flight redo is about to replace."""
+    c, events, service = setup()
+    service._decoding.add("s0")  # a decode wrote the cache but has not resolved yet
+    assert c.engine.is_loaded("s0"), "cache already looks ready - that is the trap"
+    c.send(p.Play("s0"))
+    assert c.engine.plays == [], "must not play a cache a still-in-flight decode might replace"
+    assert service._pending["s0"] == (1.0, False)
+    service._decoded("s0", True, None)  # the race resolves: the pending play is released
+    assert c.engine.plays == [("s0", 1.0)]
+    print("play wartet auf einen noch laufenden Zuschnitt-Dekodier-Vorgang: OK")
+
+
+def test_a_play_pending_on_a_skipped_large_sound_still_plays():
+    """reload() queues an up-front decode for a sound that turns out to be too large to
+    decode up front; `_decode`'s early return for that case must still resolve a Play
+    that arrived and was queued as pending while the decode sat in the worker queue, or
+    that press is lost forever (`_pending` is only ever cleared from `_decoded`/`_skipped`,
+    never on its own)."""
+    original_lazy = playback.LAZY_DECODE_BYTES
+    playback.LAZY_DECODE_BYTES = 0  # every 1-byte test file counts as "too large"
+    try:
+        c, events, service = setup(loaded=False)
+        workers = core_fakes.QueuedWorkers()
+        c.workers = workers
+        service.reload("s0")  # queues the up-front decode that will hit the size check
+        assert "s0" in service._decoding
+        c.send(p.Play("s0"))  # arrives before the worker runs: queued as pending
+        assert "s0" in service._pending
+        workers.run_all()  # the skip must still release the pending play
+        assert c.engine.plays == [("s0", 1.0)], c.engine.plays
+        assert "s0" not in service._pending and "s0" not in service._decoding
+        print("ein Play, das auf einen uebersprungenen grossen Sound wartete, spielt doch: OK")
+    finally:
+        playback.LAZY_DECODE_BYTES = original_lazy
+
+
+def test_a_trim_preview_plays_the_clip_on_the_headphones_only():
+    c, events, service = setup()
+    clip = np.zeros((4800, 2), dtype=np.float32)
+    service.play_clip("s0", clip)
+    assert c.engine.clips == [("s0", 4800, 1.0)], c.engine.clips
+    assert c.engine.plays == [], "kein normales Play"
+    assert service.playing == {"s0"}
+    assert c.store.data["sounds"][0].get("plays", 0) == 0, "Vorhoeren zaehlt nicht"
+    service.play_clip("gone", clip)
+    assert len(c.engine.clips) == 1
+    print("Vorhoeren spielt den Schnitt nur im Kopfhoerer: OK")
+
+
 def test_preview_goes_to_the_headphones_only():
     c, events, service = setup(loaded=False)
     c.send(p.Play("s0", 0.5, preview=True))  # decoded on demand first
@@ -326,12 +454,14 @@ def test_the_plays_counter_is_persisted_debounced_not_on_every_play():
 
 def main():
     test_play_uses_the_normalized_gain_and_reports_start()
+    test_music_sounds_use_the_music_target_and_are_marked()
     test_preview_goes_to_the_headphones_only()
     test_long_sounds_are_decoded_only_when_played()
     test_end_of_playback_is_polled_on_the_device()
     test_an_undecoded_sound_is_decoded_then_played()
     test_a_missing_file_is_reported_and_not_retried()
     test_a_device_failure_becomes_a_hint()
+    test_a_play_with_no_target_is_not_reported_as_playing()
     test_a_play_that_waited_too_long_is_dropped()
     test_stop_and_stop_all()
     test_results_for_deleted_sounds_are_dropped()
@@ -346,6 +476,12 @@ def main():
     test_spamming_within_the_use_window_counts_once()
     test_the_window_is_per_sound_and_previews_do_not_open_it()
     test_the_plays_counter_is_persisted_debounced_not_on_every_play()
+    test_the_trim_travels_with_every_decode()
+    test_reload_decodes_again_with_the_new_trim()
+    test_a_decode_that_raced_a_trim_change_is_redone()
+    test_play_does_not_trust_a_cache_a_stale_decode_might_still_replace()
+    test_a_play_pending_on_a_skipped_large_sound_still_plays()
+    test_a_trim_preview_plays_the_clip_on_the_headphones_only()
     print("\nALL PLAYBACK LOGIC CHECKS PASSED")
 
 

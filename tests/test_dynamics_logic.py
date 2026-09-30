@@ -127,6 +127,55 @@ def test_leveler_does_not_modify_its_input():
     print("leveler does not modify its input: OK")
 
 
+def feed_music(leveler, level_db, seconds, start=0):
+    """Stereo sine at level_db dBFS RMS through the music leveler for `seconds`;
+    returns the last output block."""
+    out = None
+    for i in range(int(seconds * RATE / FRAMES)):
+        mono = sine(level_db, start=start + i * FRAMES)
+        out = leveler.process(np.hstack([mono, mono]))
+    return out
+
+
+def test_music_leveler_lifts_a_quiet_spotify_to_the_reference():
+    # Jan 2026-09-30: Spotify turned down for his ears must still reach the cables
+    # at the "Spotify 100 %" level - the bus levels itself (Auto-Pegel).
+    lev = dynamics.MusicLeveler()
+    out = feed_music(lev, -34.0, 20.0)
+    assert abs(dynamics.block_rms_db(out) - dynamics.MUSIC_REFERENCE_DB) < 1.0, dynamics.block_rms_db(out)
+    assert abs(lev.gain_db - 20.0) < 1.0, lev.gain_db
+    print("Musik-Leveler hebt leises Spotify auf den Bezug: OK")
+
+
+def test_music_leveler_boost_and_cut_are_capped():
+    lev = dynamics.MusicLeveler()
+    feed_music(lev, -55.0, 30.0)
+    assert abs(lev.gain_db - dynamics.MUSIC_MAX_BOOST_DB) < 1e-6, lev.gain_db
+    lev = dynamics.MusicLeveler()
+    feed_music(lev, 0.0, 10.0)
+    assert abs(lev.gain_db - dynamics.MUSIC_MAX_CUT_DB) < 1e-6, lev.gain_db
+    print("Musik-Leveler: Boost und Absenkung begrenzt: OK")
+
+
+def test_music_leveler_rises_slowly_and_holds_through_silence():
+    lev = dynamics.MusicLeveler()
+    feed_music(lev, -34.0, 1.0)
+    assert 0.0 < lev.gain_db <= dynamics.MusicLeveler().rise_db_per_s + 1e-6, lev.gain_db
+    feed_music(lev, -34.0, 20.0)
+    settled = lev.gain_db
+    feed_music(lev, -120.0, 5.0)  # a pause in Spotify: no boost creep, no drop
+    assert abs(lev.gain_db - settled) < 1e-6, (lev.gain_db, settled)
+    print("Musik-Leveler steigt langsam und haelt in Pausen: OK")
+
+
+def test_music_leveler_follows_a_louder_spotify_down():
+    lev = dynamics.MusicLeveler()
+    feed_music(lev, -34.0, 20.0)
+    feed_music(lev, -14.0, 10.0)
+    assert abs(lev.gain_db) < 1.0, lev.gain_db
+    print("Musik-Leveler folgt lauterem Spotify: OK")
+
+
 def main():
     test_db_conversion()
     test_limiter_caps_peaks_immediately()
@@ -138,6 +187,10 @@ def main():
     test_leveler_tames_loud_speech()
     test_leveler_attenuates_pauses()
     test_leveler_does_not_modify_its_input()
+    test_music_leveler_lifts_a_quiet_spotify_to_the_reference()
+    test_music_leveler_boost_and_cut_are_capped()
+    test_music_leveler_rises_slowly_and_holds_through_silence()
+    test_music_leveler_follows_a_louder_spotify_down()
     print("\nALL DYNAMICS LOGIC CHECKS PASSED")
 
 

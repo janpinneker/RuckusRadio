@@ -27,6 +27,15 @@ BAD_IMAGE_HINT = "Wähl ein PNG-, JPG-, BMP- oder WEBP-Bild."
 log = logging.getLogger(__name__)
 
 
+def _klangbild_cfg(app: "RuckusRadioApp") -> dict | None:
+    """F4: loudness_badge()/loudness_summary() need the configured Klangbild targets,
+    not always the voice target - Tk only has the core's last snapshot (RoutingService
+    publishes them at devices.levels.targets, see routing.py's snapshot())."""
+    targets = (((getattr(app, "snapshot", None) or {}).get("devices") or {})
+              .get("levels") or {}).get("targets")
+    return {"klangbild_targets": targets} if targets else None
+
+
 SS = 4  # supersampling factor for anti-aliased discs
 
 
@@ -156,7 +165,7 @@ class SoundTile(ctk.CTkFrame):
             self.hotkey_label.bind("<Button-1>", self._on_hotkey_label_click)
         self.hotkey_label.pack(pady=(2, 0), ipadx=6)
         self.level_label = ctk.CTkLabel(
-            self, text=loudness_badge(sound), height=14,
+            self, text=loudness_badge(sound, _klangbild_cfg(app)), height=14,
             font=theme.body_font(theme.SIZE_KEYCAP), text_color=theme.MUTED,
         )
         self.level_label.pack(pady=(1, 0))
@@ -522,7 +531,7 @@ class VolumeDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(body, text=f"Lautstärke für „{sound['name']}“", text_color=theme.TEXT,
                      font=theme.display_font(theme.SIZE_SECTION), anchor="w").pack(fill="x")
-        ctk.CTkLabel(body, text=loudness_summary(sound), anchor="w", justify="left",
+        ctk.CTkLabel(body, text=loudness_summary(sound, _klangbild_cfg(app)), anchor="w", justify="left",
                      wraplength=400, text_color=theme.MUTED,
                      font=theme.body_font()).pack(fill="x", pady=(2, 0))
 
