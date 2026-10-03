@@ -65,6 +65,30 @@ def test_add_mp4_with_icon_dedupes_the_name():
     print("mp4 is extracted to mp3, a duplicate name gets (2): OK")
 
 
+def test_add_accepts_the_common_audio_formats():
+    """Bibliothek 2.0 A12: m4a, aac, wav, ogg, opus, flac werden beim Hinzufuegen zu
+    MP3; der Dateidialog bietet sie alle an."""
+    import subprocess
+
+    from soundboard import filedialogs, paths
+    offered = filedialogs.SOUND_TYPES[0][1].split()
+    for ext in ("mp3", "mp4", "m4a", "aac", "wav", "ogg", "opus", "flac"):
+        assert f"*.{ext}" in offered, (ext, offered)
+    src_dir = Path(tempfile.mkdtemp(prefix="ruckus-formats-"))
+    c, events = setup()
+    for ext in ("m4a", "aac", "wav", "ogg", "opus", "flac"):
+        src = src_dir / f"tone.{ext}"
+        subprocess.run([paths.ffmpeg_path(), "-v", "error", "-y", "-i", str(FIX / "test_tone.mp3"), str(src)],
+                       check=True, timeout=60)
+        c.send(p.AddSound(str(src), f"Ton {ext}"))
+        sound = c.library.sounds[-1]
+        assert sound["name"] == f"Ton {ext}", (ext, notices(events)[-3:])
+        audio = Path(_TMP) / sound["file"]
+        assert audio.suffix == ".mp3" and audio.stat().st_size > 0, ext
+        assert "integrated" in sound["loudness"], (ext, sound)
+    print("m4a/aac/wav/ogg/opus/flac werden beim Hinzufuegen zu MP3: OK")
+
+
 def test_failed_adds_leave_nothing_behind():
     c, events = setup()
     before = files()
@@ -80,6 +104,18 @@ def test_failed_adds_leave_nothing_behind():
     assert errors == [library.ICON_UNREADABLE.format(name="notimage.png"),
                       library.AUDIO_UNREADABLE.format(name="broken.mp4")], errors
     print("an unreadable icon or audio file adds nothing and explains why: OK")
+
+
+def test_a_sound_name_holds_at_most_50_characters():
+    """Jan 2026-10-04: adding and renaming cut a name to 50 characters (the page's
+    fields stop there too; the core is the last guard)."""
+    c, _ = setup()
+    c.send(p.AddSound(str(FIX / "test_tone.mp3"), "a" * 70))
+    sound = c.library.sounds[-1]
+    assert sound["name"] == "a" * 50, len(sound["name"])
+    c.send(p.RenameSound(sound["id"], "  " + "b" * 60 + "  "))
+    assert sound["name"] == "b" * 50, len(sound["name"])
+    print("ein Sound-Name hat hoechstens 50 Zeichen: OK")
 
 
 def test_rename_volume_and_icon():
@@ -363,8 +399,10 @@ def test_a_trim_remeasure_keeps_the_stored_duration_and_category():
 def main():
     test_add_copies_measures_and_announces()
     test_add_mp4_with_icon_dedupes_the_name()
+    test_add_accepts_the_common_audio_formats()
     test_failed_adds_leave_nothing_behind()
     test_rename_volume_and_icon()
+    test_a_sound_name_holds_at_most_50_characters()
     test_icon_change_unreadable_message_matches_todays_gui_text()
     test_deleted_sound_icon_is_cleaned_up_when_the_change_lands_late()
     test_icon_rev_increments_on_a_successful_change()

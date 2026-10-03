@@ -93,7 +93,13 @@ def test_the_view_may_not_manage_anything():
                 p.RequestAddSound(), p.RequestImportPack(),
                 p.RequestExportSounds(None), p.RequestSetSoundIcon("s"),
                 p.LoadWaveform("s"), p.PreviewTrim("s", 0.0, 1.0), p.SetSoundTrim("s", 0.0, 1.0),
-                p.ClearSoundTrim("s"), p.RequestExportTrimmed("s"),):
+                p.ClearSoundTrim("s"), p.RequestExportTrimmed("s"),
+                p.CreateFolder("f-1", "Memes"), p.CreateFolder("f-2", "Unter", "f-1", "sounds"),
+                p.RenameFolder("f-1", "Neu"), p.DeleteFolder("f-1"), p.MoveToFolder(("s1", "s2"), "f-1"),
+                p.MoveToFolder(("s1",), None), p.CreatePlaylist("p-1", "Lieblinge"),
+                p.RenamePlaylist("p-1", "Neu"), p.DeletePlaylist("p-1"), p.AddToPlaylist("p-1", ("s1",)),
+                p.RemoveFromPlaylist("p-1", ("s1",)), p.SetTags("s1", ("lustig", "kurz")),
+                p.SetFavorite("s1", True),):
         # Die Spotify-Lesebefehle stehen bewusst NICHT hier: die Ansicht darf sie.
         assert not a.may_send(access.ROLE_VIEW, cmd), cmd
     assert not a.may_send("quatsch", p.Play("s"))

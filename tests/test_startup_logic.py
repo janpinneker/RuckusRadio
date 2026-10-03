@@ -149,6 +149,12 @@ def test_an_update_run_brings_one_notice_with_whats_new():
     assert "Discord: Musik" in routing, "name the new dock button"
     assert "Seitenleiste" in routing and "Kürzen" in routing, "pins and the trim editor are new in 1.4.0"
     assert "gleicht" in routing, "the bus levels itself: the Spotify slider is only for your ears"
+    [library] = app_main.startup_notices(["--updated"], "1.5.0")
+    assert "Ordner" in library and "Playlists" in library, "Bibliothek 2.0 is the headline of 1.5.0"
+    assert "Cover" in library and "Verschieben" in library, "own covers and moving are new"
+    assert "Spotify" in library, "the Spotify page is new too"
+    assert "verschlüsselt" in library, "the login moved from clear text to secrets.dat"
+    assert len(library) < 600, "one short paragraph, not release notes"
     [plain] = app_main.startup_notices(["--updated"], "9.9.9")
     assert "9.9.9" in plain and "Web-Oberfläche" not in plain, "no news without an entry"
     assert app_main.parse_mode(["--updated"]) == "web", "--updated changes no start path"

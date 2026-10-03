@@ -98,6 +98,19 @@ def test_an_export_asks_for_the_target_and_uses_the_existing_flow():
     print("ohne Sounds wird nicht nach einem Ziel gefragt: OK")
 
 
+def test_the_suggested_export_name_is_a_valid_windows_file_name():
+    dialogs = FakeDialogs(sound=str(SOUND), target=None)
+    c, events = wire(dialogs)
+    c.send(p.RequestAddSound())
+    sound_id = c.state("library")["sounds"][0]["id"]
+    for name, expected in (("Was?: los", "Was los"), ("CON", "CON_")):
+        c.send(p.RenameSound(sound_id, name))
+        dialogs.asked.clear()
+        c.send(p.RequestExportSounds(sound_id))
+        assert dialogs.asked == [f"target:{expected}.ruckuspack"], dialogs.asked
+    print("der Export-Vorschlag ist ein gueltiger Windows-Dateiname: OK")
+
+
 def test_the_requests_need_the_library_capability():
     for cls, args in ((p.RequestAddSound, {}), (p.RequestImportPack, {}),
                       (p.RequestExportSounds, {"sound_id": None}),
@@ -113,6 +126,7 @@ def main():
     test_a_cancelled_dialog_changes_nothing()
     test_a_chosen_file_reaches_the_core_without_the_page()
     test_an_export_asks_for_the_target_and_uses_the_existing_flow()
+    test_the_suggested_export_name_is_a_valid_windows_file_name()
     test_the_requests_need_the_library_capability()
     print("\nALL REQUESTS CHECKS PASSED")
 

@@ -335,6 +335,49 @@ def test_klangbild_defaults_and_old_configs():
     print("Klangbild-Schluessel: Standard, alte Config, Teilwerte: OK")
 
 
+def test_library_keys_default_and_bad_entries_are_dropped():
+    """Bibliothek 2.0 (A1): Ordner/Playlists starten leer; was eine von Hand
+    bearbeitete Datei kaputt macht, wird beim Laden verworfen statt abzustuerzen."""
+    fresh = config._default_config()
+    assert fresh["folders"] == [] and fresh["playlists"] == []
+    old = config._with_defaults({"version": 2, "sounds": []})
+    assert old["folders"] == [] and old["playlists"] == []
+    merged = config._with_defaults({
+        "version": 2,
+        "folders": [
+            {"id": "f-1", "name": "Memes", "parent_id": None},
+            {"id": "f-2", "name": "Unter", "parent_id": "f-1"},
+            {"id": "f-3", "name": "Waise", "parent_id": "f-weg"},   # parent missing -> root
+            {"id": "bad id!", "name": "x", "parent_id": None},      # invalid id
+            {"id": "f-1", "name": "Doppelt", "parent_id": None},    # duplicate id
+            {"id": "f-4", "name": "   ", "parent_id": None},        # empty name
+            "kein dict",
+        ],
+        "playlists": [
+            {"id": "p-1", "name": "Lieblinge", "item_ids": ["s1", "s1", "weg", 5]},
+            {"id": "p-2", "name": 7, "item_ids": []},
+            {"id": "p-3", "name": "Ohne Liste"},
+        ],
+        "sounds": [
+            {"id": "s1", "name": "A", "folder_id": "f-2", "tags": [" Lustig ", "lustig", 3, ""], "favorite": True},
+            {"id": "s2", "name": "B", "folder_id": "f-weg", "tags": "kein", "favorite": "ja"},
+        ],
+    })
+    assert merged["folders"] == [
+        {"id": "f-1", "name": "Memes", "parent_id": None, "cover": None},
+        {"id": "f-2", "name": "Unter", "parent_id": "f-1", "cover": None},
+        {"id": "f-3", "name": "Waise", "parent_id": None, "cover": None},
+    ], merged["folders"]
+    assert merged["playlists"] == [
+        {"id": "p-1", "name": "Lieblinge", "item_ids": ["s1"], "cover": None},
+        {"id": "p-3", "name": "Ohne Liste", "item_ids": [], "cover": None},
+    ], merged["playlists"]
+    s1, s2 = merged["sounds"]
+    assert (s1["folder_id"], s1["tags"], s1["favorite"]) == ("f-2", ["Lustig"], True), s1
+    assert (s2["folder_id"], s2["tags"], s2["favorite"]) == (None, [], False), s2
+    print("Bibliothek: Standard leer, kaputte Eintraege verworfen: OK")
+
+
 def main():
     test_fresh_config_has_outputs()
     test_old_config_keeps_working()
@@ -353,6 +396,7 @@ def main():
     test_stop_all_migration_survives_non_string_hotkeys()
     test_music_bus_defaults_and_gain_clamping()
     test_klangbild_defaults_and_old_configs()
+    test_library_keys_default_and_bad_entries_are_dropped()
     print("\nALL CONFIG LOGIC CHECKS PASSED")
 
 

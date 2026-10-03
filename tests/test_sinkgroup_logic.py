@@ -489,6 +489,28 @@ def test_offset_applies_to_cables_not_to_the_monitor():
     print("offset applies to cables, not to the monitor: OK")
 
 
+def test_moving_the_offset_while_a_sound_plays_ramps_instead_of_jumping():
+    """Dragging "Sounds unter Stimme"/"Musik unter Stimme" must not step the level of a
+    playing sound in one sample (audible click): the change glides over one block."""
+    cable = fake_target("CABLE Output", settings(mic=False))
+    group = start_with_mic(sinkgroup.SinkGroup([cable], mic_device=None))
+    group.apply_levels(-6.0, False, -6.0, music_offset_db=-6.0)
+    group.add_source(tone(0.4, frames=FRAMES * 10), gain=1.0)
+    group.add_source(tone(0.2, frames=FRAMES * 10), gain=1.0, music=True)
+    old = 0.4 * dynamics.db_to_gain(-6.0) + 0.2 * dynamics.db_to_gain(-6.0)
+    assert np.allclose(pull(cable), old, atol=1e-6)
+    group.apply_levels(-12.0, False, -6.0, music_offset_db=-12.0)
+    new = 0.4 * dynamics.db_to_gain(-12.0) + 0.2 * dynamics.db_to_gain(-12.0)
+    out = pull(cable)[:, 0]
+    assert abs(out[0] - old) < (old - new) * 0.05, (float(out[0]), old)
+    assert np.allclose(out[-1], new, atol=1e-6), (float(out[-1]), new)
+    assert np.all(np.diff(out) <= 1e-7), "the level only goes down, no step back up"
+    assert np.max(np.abs(np.diff(out))) < (old - new) / 10, "no single big step"
+    assert np.allclose(pull(cable), new, atol=1e-6), "after the ramp the level holds"
+    group.stop()
+    print("moving the offset while a sound plays ramps instead of jumping: OK")
+
+
 def test_ducking_lowers_sounds_while_speaking():
     cable = fake_target("CABLE Output", settings(mic=False))
     group = start_with_mic(sinkgroup.SinkGroup([cable], mic_device=None))
@@ -841,6 +863,7 @@ def main():
     test_mic_chain_runs_once_before_the_fan_out()
     test_sounds_bypass_the_mic_chain()
     test_offset_applies_to_cables_not_to_the_monitor()
+    test_moving_the_offset_while_a_sound_plays_ramps_instead_of_jumping()
     test_ducking_lowers_sounds_while_speaking()
     test_muted_mic_never_ducks()
     test_sound_limiter_catches_overlaps()

@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -68,8 +69,52 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # "musik-bus-kern"): aus beim Start, der Pegel begrenzt auf 0.0-2.0.
     "musicbus_enabled": False,
     "musicbus_gain": 1.0,
+    # Bibliothek 2.0 (spec 2026-10-01-bibliothek-2, A1): folders/playlists of the
+    # sounds area; each sound may carry folder_id, tags and favorite.
+    "folders": [],  # [{id, name, parent_id, cover}]
+    "playlists": [],  # [{id, name, item_ids, cover}]
     "sounds": [],
 }
+
+# Bibliothek 2.0 limits (A3, A6, A8) - shared with collections.py.
+COLLECTION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+MAX_COLLECTION_NAME = 80
+MAX_SOUND_NAME = 50  # Jan 2026-10-04 (Nachtlauf B5): a sound name holds at most 50 characters
+MAX_TAGS = 20
+MAX_TAG_LEN = 32
+
+
+def clean_collection_name(name: Any) -> str | None:
+    """Trimmed name, or None when it is no string, empty or longer than allowed."""
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    return name if 0 < len(name) <= MAX_COLLECTION_NAME else None
+
+
+def clip_sound_name(name: str) -> str:
+    """A sound name from outside (pack, file name): trimmed and cut to MAX_SOUND_NAME."""
+    return name.strip()[:MAX_SOUND_NAME].strip()
+
+
+def normalize_tags(tags: Any) -> list[str]:
+    """Like the web page's normalizeTags: trimmed strings, no case-insensitive
+    duplicates, at most MAX_TAGS of at most MAX_TAG_LEN characters each."""
+    if not isinstance(tags, (list, tuple)):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in tags:
+        if not isinstance(raw, str):
+            continue
+        tag = raw.strip()[:MAX_TAG_LEN].strip()
+        if not tag or tag.lower() in seen:
+            continue
+        seen.add(tag.lower())
+        out.append(tag)
+        if len(out) == MAX_TAGS:
+            break
+    return out
 
 
 def get_app_data_dir() -> Path:
@@ -97,7 +142,80 @@ def _with_defaults(loaded: dict[str, Any]) -> dict[str, Any]:
     _migrate_outputs(merged, loaded)
     _migrate_levels(merged, loaded)
     _migrate_stop_all_hotkey(merged, loaded)
+    _clean_library(merged)
     return merged
+
+
+def cover_path(collection_id: str) -> str:
+    """Schritt C: a folder's or playlist's own cover, relative to the data dir."""
+    return f"covers/{collection_id}.png"
+
+
+def _clean_cover(value: Any, collection_id: str) -> str | None:
+    """Only the collection's own file counts; anything hand-edited elsewhere is dropped."""
+    return value if value == cover_path(collection_id) else None
+
+
+def _clean_library(merged: dict[str, Any]) -> None:
+    """Bibliothek 2.0: drop what a hand-edited file broke instead of crashing later.
+    Folders with a missing parent, or caught in a loop, move to the root; sounds pointing at a missing
+    folder lose the folder; playlists keep each existing entry once."""
+    folders: list[dict] = []
+    ids: set[str] = set()
+    for f in merged.get("folders") if isinstance(merged.get("folders"), list) else []:
+        if not isinstance(f, dict):
+            continue
+        fid, name = f.get("id"), clean_collection_name(f.get("name"))
+        if not isinstance(fid, str) or not COLLECTION_ID_RE.fullmatch(fid) or fid in ids or name is None:
+            continue
+        ids.add(fid)
+        parent = f.get("parent_id")
+        folders.append({"id": fid, "name": name, "parent_id": parent if isinstance(parent, str) else None,
+                        "cover": _clean_cover(f.get("cover"), fid)})
+    for f in folders:
+        if f["parent_id"] not in ids or f["parent_id"] == f["id"]:
+            f["parent_id"] = None
+    parent_of = {f["id"]: f["parent_id"] for f in folders}
+    for f in folders:  # a loop (a -> b -> a) would make every walk up circle: cut it here
+        cur, seen = parent_of[f["id"]], {f["id"]}
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            cur = parent_of[cur]
+        if cur is not None:
+            f["parent_id"] = parent_of[f["id"]] = None
+    merged["folders"] = folders
+
+    playlists: list[dict] = []
+    pids: set[str] = set()
+    for pl in merged.get("playlists") if isinstance(merged.get("playlists"), list) else []:
+        if not isinstance(pl, dict):
+            continue
+        pid, name = pl.get("id"), clean_collection_name(pl.get("name"))
+        if not isinstance(pid, str) or not COLLECTION_ID_RE.fullmatch(pid) or pid in pids or name is None:
+            continue
+        pids.add(pid)
+        playlists.append({"id": pid, "name": name, "item_ids": list(pl.get("item_ids") or [])
+                          if isinstance(pl.get("item_ids"), list) else [],
+                          "cover": _clean_cover(pl.get("cover"), pid)})
+
+    sounds = merged.get("sounds") if isinstance(merged.get("sounds"), list) else []
+    sound_ids = {s.get("id") for s in sounds if isinstance(s, dict)}
+    for pl in playlists:
+        items: list[str] = []
+        for item in pl["item_ids"]:
+            if isinstance(item, str) and item in sound_ids and item not in items:
+                items.append(item)
+        pl["item_ids"] = items
+    merged["playlists"] = playlists
+
+    for s in sounds:
+        if not isinstance(s, dict):
+            continue
+        folder = s.get("folder_id")
+        s["folder_id"] = folder if isinstance(folder, str) and folder in ids else None
+        s["tags"] = normalize_tags(s.get("tags"))
+        s["favorite"] = s.get("favorite") is True
+        s["cover"] = _clean_cover(s.get("cover"), str(s.get("id")))  # own cover, hand check 2026-10-03b
 
 
 def _migrate_stop_all_hotkey(merged: dict[str, Any], loaded: dict[str, Any]) -> None:

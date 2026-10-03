@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +44,9 @@ HEARTBEAT_S = 15.0
 LOCAL_HOSTS = ("127.0.0.1", "localhost")
 TOKEN_HEADER = "X-Ruckus-Token"
 MAX_BODY = 1 << 20  # a command is small; anything larger is refused
+# Bundles waiting for one event stream. The pump sends at most ~30 per second, so this is
+# well over half a minute of a client that does not read - then its stream is ended.
+MAX_STREAM_BACKLOG = 1000
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -115,7 +119,14 @@ def safe_dist_path(dist: Path, url_path: str) -> Path | None:
 
 
 class QuietThreadingHTTPServer(ThreadingHTTPServer):
-    """A client that hangs up mid-request must not print a traceback.
+    """Binds its port alone, and a client that hangs up mid-request prints no traceback.
+
+    Port: http.server sets SO_REUSEADDR, and on Windows that lets a second socket bind a
+    port another program already holds - the two then share 47800, requests land at
+    random, and the fallback below never runs (measured 2026-10-03). So the reuse flag
+    is off, and on Windows SO_EXCLUSIVEADDRUSE refuses anyone binding next to us.
+
+    Tracebacks:
 
     When a tab closes while the handler is still reading the request (or writing the
     answer), ``socketserver`` reaches ``handle_error`` with a ConnectionResetError /
@@ -125,6 +136,14 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
     visible. Measured on Chrome 153: closing a tab produced one such traceback per
     request (SSE stream, /state, a static file).
     """
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)  # Windows only
+        if exclusive is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        super().server_bind()
 
     def handle_error(self, request, client_address) -> None:
         exc = sys.exc_info()[1]
@@ -182,11 +201,33 @@ class SseServer:
             return None
         return client_id
 
+    def open_stream(self, client_id: str) -> queue.Queue:
+        """The bounded queue behind one event stream."""
+        stream: queue.Queue = queue.Queue(maxsize=MAX_STREAM_BACKLOG)
+        with self._lock:
+            self._streams[client_id] = stream
+        return stream
+
     def deliver(self, client_id: str, messages: list) -> None:
         with self._lock:
             stream = self._streams.get(client_id)
-        if stream is not None:
-            stream.put(messages)
+            if stream is None:
+                return
+            try:
+                stream.put_nowait(messages)
+                return
+            except queue.Full:
+                # a client that stopped reading: end its stream instead of growing it. The
+                # page's EventSource reconnects and fetches the full state again.
+                self._streams.pop(client_id, None)
+        log.warning("event stream %s fell %d bundles behind; ending it",
+                    client_id, MAX_STREAM_BACKLOG)
+        while True:
+            try:
+                stream.get_nowait()
+            except queue.Empty:
+                break
+        stream.put_nowait(None)
 
     # ---- helpers ----
 
@@ -228,8 +269,18 @@ class SseServer:
         self._httpd.serve_forever(poll_interval=0.2)
 
     def stop(self) -> None:
-        for stream in list(self._streams.values()):
-            stream.put(None)  # ends the SSE loop
+        with self._lock:
+            streams = list(self._streams.values())
+        for stream in streams:
+            try:
+                stream.put_nowait(None)  # ends the SSE loop
+            except queue.Full:  # a stuck stream: drop its backlog, then end it
+                while not stream.empty():
+                    try:
+                        stream.get_nowait()
+                    except queue.Empty:
+                        break
+                stream.put_nowait(None)
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -438,9 +489,7 @@ class SseServer:
                 # away, without waiting for a separate /state on another connection.
                 server_self.bridge.mark_ready(client_id)
                 server_self.bridge.stream_opened(client_id)
-                stream: queue.Queue = queue.Queue()
-                with server_self._lock:
-                    server_self._streams[client_id] = stream
+                stream = server_self.open_stream(client_id)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")

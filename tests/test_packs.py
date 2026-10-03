@@ -303,6 +303,42 @@ def test_corrupt_crc_on_second_of_three_sounds_rolls_back_nothing_written():
     print("corrupt CRC on 2nd of 3 sounds -> PackError, no files left: OK")
 
 
+def test_tags_travel_with_the_pack_but_folder_and_favorite_stay_home():
+    """Bibliothek 2.0 A10: Stichwoerter beschreiben den Sound und reisen mit; Ordner
+    und Favorit sind persoenliche Ordnung und bleiben lokal. Fremde Werte werden
+    beim Import normalisiert."""
+    src_dir = new_data_dir()
+    src_config = blank_config()
+    tagged = make_sound(src_dir, src_config, "Mit Tags")
+    tagged.update(tags=["Lustig", "kurz"], folder_id="f-1", favorite=True)
+    plain = make_sound(src_dir, src_config, "Ohne Tags")
+    zip_path = Path(tempfile.mkdtemp()) / "tags.ruckuspack"
+    export_pack(src_config, src_dir, [tagged["id"], plain["id"]], zip_path)
+    with zipfile.ZipFile(zip_path) as zf:
+        manifest = json.loads(zf.read("manifest.json"))
+        metas = [json.loads(zf.read(f"{folder}/meta.json")) for folder in manifest["sounds"]]
+    assert any(m.get("tags") == ["Lustig", "kurz"] for m in metas), metas
+    assert all("folder_id" not in m and "favorite" not in m for m in metas), metas
+    assert any("tags" not in m for m in metas), "no empty tag list written"
+    first, second = import_pack(zip_path, set(), new_data_dir())
+    assert first["tags"] == ["Lustig", "kurz"] and second["tags"] == []
+    assert first["folder_id"] is None and first["favorite"] is False, "stay home: fresh values"
+
+    foreign = Path(tempfile.mkdtemp()) / "fremde_tags.ruckuspack"
+    with zipfile.ZipFile(zip_path) as zf_in, zipfile.ZipFile(foreign, "w") as zf_out:
+        for item in zf_in.infolist():
+            data = zf_in.read(item.filename)
+            if item.filename.endswith("meta.json"):
+                meta = json.loads(data)
+                if "tags" in meta:
+                    meta["tags"] = [" a ", "A", 5, "b"]
+                data = json.dumps(meta).encode()
+            zf_out.writestr(item.filename, data)
+    first, _ = import_pack(foreign, set(), new_data_dir())
+    assert first["tags"] == ["a", "b"], first["tags"]
+    print("Stichwoerter reisen im Pack, Ordner/Favorit bleiben lokal: OK")
+
+
 def test_sanitize_filename_strips_windows_illegal_characters():
     assert sanitize_filename("Was?!") == "Was!"
     assert sanitize_filename('Say "hi" <now>') == "Say hi now"
@@ -324,6 +360,22 @@ def test_sanitize_filename_falls_back_to_sound_when_empty():
     print("sanitize_filename falls back to 'Sound': OK")
 
 
+def test_sanitize_filename_avoids_windows_reserved_names():
+    # Windows refuses these as a file name, with any extension and any case.
+    for name in ("CON", "con", "PRN", "AUX", "NUL", "COM1", "com9", "LPT1", "Lpt9",
+                 "COM¹", "NUL.txt", "con."):
+        cleaned = sanitize_filename(name)
+        assert cleaned.split(".")[0].upper() not in {
+            "CON", "PRN", "AUX", "NUL", *(f"COM{c}" for c in "123456789¹²³"),
+            *(f"LPT{c}" for c in "123456789¹²³")}, (name, cleaned)
+        assert cleaned, name
+    # Names that only start like a reserved word stay untouched.
+    assert sanitize_filename("Console") == "Console"
+    assert sanitize_filename("Nullpunkt") == "Nullpunkt"
+    assert sanitize_filename("COM10") == "COM10"
+    print("sanitize_filename avoids Windows reserved names: OK")
+
+
 def _pack_with_metas(metas: list[dict], icon_bytes: bytes | None = None) -> Path:
     """Hand-built pack: one folder per meta dict (audio = the test tone)."""
     pack = Path(tempfile.mkdtemp(prefix="ruckus-pack-")) / "hand.ruckuspack"
@@ -337,6 +389,45 @@ def _pack_with_metas(metas: list[dict], icon_bytes: bytes | None = None) -> Path
                 zf.writestr(f"{folder}/icon.png", icon_bytes)
         zf.writestr("manifest.json", json.dumps({"format": "ruckuspack", "version": 1, "sounds": folders}))
     return pack
+
+
+def test_the_sound_cover_travels_with_the_pack():
+    """Jan 2026-10-04: a sound's own cover goes into the pack and comes back as the new
+    sound's cover; a broken or foreign cover file is dropped, the import still works."""
+    from PIL import Image
+    src_dir = new_data_dir()
+    src_config = blank_config()
+    covered = make_sound(src_dir, src_config, "Mit Cover")
+    (src_dir / "covers").mkdir()
+    Image.new("RGB", (64, 64), (200, 30, 30)).save(src_dir / "covers" / f"{covered['id']}.png")
+    covered["cover"] = config.cover_path(covered["id"])
+    plain = make_sound(src_dir, src_config, "Ohne Cover")
+    zip_path = Path(tempfile.mkdtemp()) / "cover.ruckuspack"
+    export_pack(src_config, src_dir, [covered["id"], plain["id"]], zip_path)
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+    assert f"{covered['id']}/cover.png" in names, names
+    assert f"{plain['id']}/cover.png" not in names
+    dst_dir = new_data_dir()
+    first, second = import_pack(zip_path, set(), dst_dir)
+    assert first["cover"] == config.cover_path(first["id"]), first
+    with Image.open(dst_dir / first["cover"]) as img:
+        assert img.size == (512, 512) and img.getpixel((256, 256))[0] > 150, "a square cover"
+    assert second["cover"] is None
+
+    broken = _pack_with_metas([{"name": "Kaputt"}])
+    with zipfile.ZipFile(broken, "a") as zf:
+        zf.writestr("f0/cover.png", b"no image")
+    [only] = import_pack(broken, set(), new_data_dir())
+    assert only["cover"] is None, "an unreadable cover is dropped, the sound stays"
+    print("das Sound-Cover reist im Pack mit: OK")
+
+
+def test_a_pack_name_is_cut_to_the_name_limit():
+    """Jan 2026-10-04: sound names hold at most 50 characters, a foreign pack too."""
+    [long_one] = import_pack(_pack_with_metas([{"name": "x" * 80}]), set(), new_data_dir())
+    assert long_one["name"] == "x" * config.MAX_SOUND_NAME and config.MAX_SOUND_NAME == 50
+    print("ein Pack-Name wird auf 50 Zeichen gekuerzt: OK")
 
 
 def test_clamp_volume():
@@ -459,12 +550,15 @@ def test_export_missing_audio_removes_partial_pack():
 
 if __name__ == "__main__":
     test_clamp_volume()
+    test_the_sound_cover_travels_with_the_pack()
+    test_a_pack_name_is_cut_to_the_name_limit()
     test_import_clamps_volume()
     test_import_icon_saved_at_icon_size()
     test_export_missing_audio_removes_partial_pack()
     test_round_trip_export_import()
     test_the_trim_travels_with_the_pack()
     test_the_category_travels_with_the_pack()
+    test_tags_travel_with_the_pack_but_folder_and_favorite_stay_home()
     test_import_pack_does_not_mutate_config_data_or_snapshot()
     test_import_name_collision_gets_suffix()
     test_import_dedups_multiple_new_sounds_against_each_other()
@@ -479,4 +573,5 @@ if __name__ == "__main__":
     test_sanitize_filename_strips_windows_illegal_characters()
     test_sanitize_filename_collapses_whitespace_and_strips_trailing_dots()
     test_sanitize_filename_falls_back_to_sound_when_empty()
+    test_sanitize_filename_avoids_windows_reserved_names()
     print("ALL PACKS TESTS PASSED")

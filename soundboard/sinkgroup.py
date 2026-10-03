@@ -62,6 +62,15 @@ def _sum_blocks(blocks: list[np.ndarray], frames: int) -> np.ndarray:
     return out
 
 
+def _gain_ramp(played: float | None, gain: float, frames: int):
+    """Gain for one block: constant, or a linear glide from the last played value to
+    `gain` (shape (frames, 1)) when it changed, ending exactly on `gain`."""
+    if played is None or played == gain:
+        return np.float32(gain)
+    ramp = np.linspace(played, gain, frames + 1, dtype=np.float32)[1:]
+    return ramp.reshape(frames, 1)
+
+
 class _AllDone:
     """Sieht aus wie threading.Event, fragt aber die Quellen.
 
@@ -156,6 +165,11 @@ class Target:
         # compensation on top of its own gain. The headphones keep 1.0.
         self.music_offset = 1.0
         self.musicbus_trim = 1.0
+        # Offsets the callback last played (None = nothing played yet). A change while
+        # sound is playing glides over one block instead of stepping (dragging the
+        # slider would click); with nothing playing the new value applies at once.
+        self._played_sounds_offset: float | None = None
+        self._played_music_offset: float | None = None
         # Sources that are music. Same lock as _sources; MixSource hashes by identity.
         self._music_sources: set[MixSource] = set()
         self.ducker: dynamics.Ducker | None = None
@@ -367,15 +381,20 @@ class Target:
         # is already ducked in its first block.
         ducker = self.ducker
         duck = ducker.next_ramp(self.voice.speaking, frames) if ducker is not None else None
+        sounds_offset, music_offset = self.sounds_offset, self.music_offset
         if chunks or music_chunks:
-            bus = _sum_blocks(chunks, frames) * np.float32(self.sounds_offset)
+            bus = _sum_blocks(chunks, frames) * _gain_ramp(
+                self._played_sounds_offset, sounds_offset, frames)
             if music_chunks:
-                bus += _sum_blocks(music_chunks, frames) * np.float32(self.music_offset)
+                bus += _sum_blocks(music_chunks, frames) * _gain_ramp(
+                    self._played_music_offset, music_offset, frames)
             if duck is not None:
                 bus = bus * duck
             blocks.append(self.limiter.process(bus))
         else:
             self.limiter.reset()
+        self._played_sounds_offset = sounds_offset
+        self._played_music_offset = music_offset
 
         outdata[:] = mix_blocks(blocks, frames)
 

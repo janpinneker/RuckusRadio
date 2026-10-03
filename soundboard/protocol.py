@@ -195,6 +195,108 @@ class SetSidebarPins(Command):
     pins: tuple
 
 
+# ---- Bibliothek 2.0 (spec 2026-10-01-bibliothek-2): folders, playlists, tags,
+# favorites of the sounds area. The page picks the new id (A3), the core checks it.
+
+@message
+class CreateFolder(Command):
+    folder_id: str
+    name: str
+    parent_id: str | None = None
+    area: str = "sounds"
+
+
+@message
+class RenameFolder(Command):
+    folder_id: str
+    name: str
+
+
+@message
+class DeleteFolder(Command):
+    """Sounds and subfolders move one level up (A5); nothing is deleted with it."""
+    folder_id: str
+
+
+@message
+class MoveFolder(Command):
+    """Hang a folder below another one (parent_id None = the top); never below itself or
+    one of its own subfolders (A4)."""
+    folder_id: str
+    parent_id: str | None = None
+
+
+@message
+class MoveToFolder(Command):
+    """folder_id None = out of every folder (the root)."""
+    sound_ids: tuple[str, ...]
+    folder_id: str | None = None
+
+
+@message
+class CreatePlaylist(Command):
+    playlist_id: str
+    name: str
+    area: str = "sounds"
+
+
+@message
+class RenamePlaylist(Command):
+    playlist_id: str
+    name: str
+
+
+@message
+class DeletePlaylist(Command):
+    playlist_id: str
+
+
+@message
+class AddToPlaylist(Command):
+    playlist_id: str
+    sound_ids: tuple[str, ...]
+
+
+@message
+class RemoveFromPlaylist(Command):
+    playlist_id: str
+    sound_ids: tuple[str, ...]
+
+
+@message
+class RequestSetCollectionCover(Command):
+    """Schritt C (E3): the core opens the image dialog, no path leaves the browser.
+    collection_kind is "folder" or "playlist"."""
+    collection_kind: str
+    collection_id: str
+
+
+@message
+class SetCollectionCover(Command):
+    """Carries a file path: window/core only (bridgecore._FILE_PATH_COMMANDS)."""
+    collection_kind: str
+    collection_id: str
+    image_path: str
+
+
+@message
+class ClearCollectionCover(Command):
+    collection_kind: str
+    collection_id: str
+
+
+@message
+class SetTags(Command):
+    sound_id: str
+    tags: tuple[str, ...]
+
+
+@message
+class SetFavorite(Command):
+    sound_id: str
+    favorite: bool
+
+
 @message
 class ToggleMicMute(Command):
     pass

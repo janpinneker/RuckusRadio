@@ -16,6 +16,7 @@ from pathlib import Path
 from . import audio, config, icons, levels, loudness, trimming
 from .audio import extract_audio
 from .filedialogs import FileDialogs
+from .collectionservice import forget_sound
 from .packs import PackError, export_pack, sanitize_filename
 from .packs import import_pack as read_pack
 from .protocol import (AddSound, ClearSoundTrim, DeleteSound, ExportSounds, ImportPack,
@@ -180,6 +181,10 @@ def prepare_sound(data_dir: Path, sound_id: str, name: str, audio_path: Path,
         "icon": f"icons/{sound_id}.png",
         "hotkey": None,
         "volume": 1.0,
+        # Bibliothek 2.0: the same shape a loaded sound has (config._clean_library)
+        "folder_id": None,
+        "tags": [],
+        "favorite": False,
     }
     # None = could not measure right now (no ffmpeg, timeout, ...): leave "loudness"
     # absent so the backfill measures it again at the next start or pack import.
@@ -225,6 +230,8 @@ class LibraryService:
         for sound in self.sounds:
             snapshot = copy.deepcopy(sound)
             snapshot["icon_rev"] = self._icon_rev.get(sound["id"], 0)
+            collections = getattr(self._core, "collections", None)
+            snapshot["image"] = collections.image_url(sound) if collections else None
             out.append(snapshot)
         return out
 
@@ -244,9 +251,10 @@ class LibraryService:
 
     def add(self, cmd: AddSound) -> None:
         sound_id = config.new_sound_id()
-        self._core.notice(f"„{cmd.name}“ wird hinzugefügt …")
+        name = config.clip_sound_name(cmd.name) or Path(cmd.path).stem[:config.MAX_SOUND_NAME] or "Sound"
+        self._core.notice(f"„{name}“ wird hinzugefügt …")
         icon_path = Path(cmd.icon_path) if cmd.icon_path else None
-        self._core.workers.submit(self._prepare, sound_id, cmd.name, Path(cmd.path), icon_path)
+        self._core.workers.submit(self._prepare, sound_id, name, Path(cmd.path), icon_path)
 
     def _prepare(self, sound_id: str, name: str, audio_path: Path,
                  icon_path: Path | None) -> None:  # worker
@@ -294,7 +302,7 @@ class LibraryService:
             sound = self._find(command.sound_id)
             if sound is None:
                 return
-            chosen, default = (sound["id"],), f"{sound['name']}.ruckuspack"
+            chosen, default = (sound["id"],), f"{sanitize_filename(sound['name'])}.ruckuspack"
         else:
             chosen = tuple(s["id"] for s in self.sounds)
             default = "sounds.ruckuspack"
@@ -325,12 +333,15 @@ class LibraryService:
                 log.warning("could not delete %s", rel, exc_info=True)
         self._core.playback.forget(cmd.sound_id)
         self._core.store.data["sounds"] = [s for s in self.sounds if s["id"] != cmd.sound_id]
+        forget_sound(self._core.store.data, cmd.sound_id)  # Bibliothek 2.0, A9
         self._icon_rev.pop(cmd.sound_id, None)
+        if sound.get("cover") and getattr(self._core, "collections", None):
+            self._core.collections.drop_cover(cmd.sound_id)
         self._save_and_publish()
 
     def rename(self, cmd: RenameSound) -> None:
         sound = self._find(cmd.sound_id)
-        name = cmd.name.strip()
+        name = config.clip_sound_name(cmd.name)
         if sound is None or not name:
             return
         sound["name"] = config.unique_name(self._core.store.data, name, exclude_id=sound["id"])

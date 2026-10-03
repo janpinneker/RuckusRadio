@@ -204,6 +204,9 @@ def run(core=None, on_window=None, serve_only: bool = False, show=console_show,
     spotify = getattr(core, "spotify", None)
     if spotify is not None:
         spotify.attach_server(server)
+    collections = getattr(core, "collections", None)
+    if collections is not None:
+        collections.attach_server(server)  # Schritt C: own covers of folders/playlists
     player = getattr(core, "spotify_player", None)
     if player is not None:
         player.attach_viewers(bridge.viewer_count)  # poll Spotify only while a page watches
@@ -237,7 +240,9 @@ def run(core=None, on_window=None, serve_only: bool = False, show=console_show,
     finally:
         bridge.close()
         server.stop()
-        core.shutdown()
+        # Fund 13 (exit code 1, no traceback): this line tells a clean Ruckus shutdown
+        # apart from a failure later in the WebView/interpreter teardown
+        log.info("Ruckus Radio stopped (core shutdown %s)", "ok" if core.shutdown() else "incomplete")
 
 
 def _wait_for_port(server, timeout: float = 5.0) -> None:

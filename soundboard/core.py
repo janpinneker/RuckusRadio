@@ -341,6 +341,8 @@ def create_core(*, inline: bool = False, engine=None, backend=None, hotkey_manag
     core.access = Access(core.store)
     core.hotkeys = HotkeyService(core, hotkey_manager)
     core.library = LibraryService(core)
+    from .collectionservice import CollectionsService
+    core.collections = CollectionsService(core)
     core.routing = RoutingService(core, backend if backend is not None else DeviceBackend())
     if autostart_module is None:
         core.settings = AppSettingsService(core)

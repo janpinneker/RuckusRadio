@@ -15,12 +15,20 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import config
+from . import config, dpapi
 
 log = logging.getLogger(__name__)
 
 SAVE_DEBOUNCE_S = 0.3  # slider drags fire on every pixel; their write waits this long
-SECRETS_NAME = "secrets.json"
+SECRETS_NAME = "secrets.dat"  # DPAPI-encrypted JSON
+LEGACY_SECRETS_NAME = "secrets.json"  # clear text up to 1.4, taken over once
+
+
+def _only_strings(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        log.warning("the secrets are not an object; starting with none")
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
 
 
 class Store:
@@ -34,6 +42,7 @@ class Store:
             self.was_reset = False
         self.data_dir: Path = config.get_app_data_dir()
         self.secrets_path: Path = self.data_dir / SECRETS_NAME
+        self.legacy_secrets_path: Path = self.data_dir / LEGACY_SECRETS_NAME
         self._secrets: dict[str, str] | None = None  # read on first use
         self.on_save_failed: Callable[[OSError], None] | None = None
         self._pending = None
@@ -57,21 +66,51 @@ class Store:
     # part of every state snapshot. It lives in its own file, is read on first use, and
     # is never logged - only its name and length are.
 
+    # On disk the file is a Windows DPAPI blob (secrets.dat), bound to the Windows
+    # account: another user, or a copy of the file on another machine, cannot read it.
+    # Up to 1.4 it was clear text (secrets.json); that file is taken over once and then
+    # deleted. If it shows up again, an older build still running wrote it later, so it
+    # is the newer one and wins.
+
     def _load_secrets(self) -> dict[str, str]:
         if self._secrets is None:
-            try:
-                raw = json.loads(self.secrets_path.read_text(encoding="utf-8"))
-            except FileNotFoundError:
-                raw = {}
-            except (OSError, ValueError):
-                log.warning("secrets.json is unreadable; starting with none", exc_info=True)
-                raw = {}
-            if not isinstance(raw, dict):
-                log.warning("secrets.json is not an object; starting with none")
-                raw = {}
-            self._secrets = {k: v for k, v in raw.items()
-                             if isinstance(k, str) and isinstance(v, str)}
+            legacy = self._read_legacy_secrets()
+            if legacy is not None:
+                self._secrets = legacy
+                if self._write_secrets():  # only then: a failed write keeps the clear text
+                    try:
+                        self.legacy_secrets_path.unlink()
+                        log.info("secrets.json taken over into the encrypted store")
+                    except OSError:
+                        log.warning("could not delete the old secrets.json", exc_info=True)
+                return self._secrets
+            raw = self._read_secret_blob()
+            self._secrets = _only_strings(raw)
         return self._secrets
+
+    def _read_legacy_secrets(self) -> dict[str, str] | None:
+        try:
+            raw = json.loads(self.legacy_secrets_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            log.warning("the old secrets.json is unreadable; ignoring it", exc_info=True)
+            return None
+        return _only_strings(raw)
+
+    def _read_secret_blob(self) -> object:
+        try:
+            blob = self.secrets_path.read_bytes()
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            log.warning("%s is unreadable; starting with none", SECRETS_NAME, exc_info=True)
+            return {}
+        try:
+            return json.loads(dpapi.unprotect(blob).decode("utf-8"))
+        except (OSError, ValueError):
+            log.warning("%s cannot be decrypted; starting with none", SECRETS_NAME)
+            return {}
 
     def secret(self, name: str) -> str | None:
         return self._load_secrets().get(name)
@@ -88,16 +127,18 @@ class Store:
         self._write_secrets()
         log.info("secret %r removed", name)
 
-    def _write_secrets(self) -> None:
+    def _write_secrets(self) -> bool:
         """Atomic like config.json: a half-written file would lock the user out of the
-        service. On a failed write the previous file stays in place."""
+        service. On a failed write the previous file stays in place (False)."""
         tmp = self.secrets_path.with_name(self.secrets_path.name + ".tmp")
         try:
-            tmp.write_text(json.dumps(self._secrets or {}, ensure_ascii=False),
-                           encoding="utf-8")
+            plain = json.dumps(self._secrets or {}, ensure_ascii=False).encode("utf-8")
+            tmp.write_bytes(dpapi.protect(plain))
             os.replace(tmp, self.secrets_path)
         except OSError:
-            log.exception("could not write secrets.json; the previous file stays")
+            log.exception("could not write %s; the previous file stays", SECRETS_NAME)
+            return False
+        return True
 
     def save_soon(self) -> None:
         self._cancel_pending()

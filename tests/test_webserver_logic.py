@@ -6,6 +6,7 @@ import http.client
 import io
 import json
 import os
+import queue
 import socket
 import struct
 import sys
@@ -333,7 +334,7 @@ def test_no_command_beyond_playback_and_music_reaches_the_view():
     `COMMAND_CAPABILITY` gelaufen wird, kann ein neuer Befehl nicht still durchrutschen.
     """
     h = Harness()
-    path_commands = (p.AddSound, p.SetSoundIcon, p.ExportSounds, p.ImportPack)
+    path_commands = (p.AddSound, p.SetSoundIcon, p.ExportSounds, p.ImportPack, p.SetCollectionCover)
     view_caps = access.ROLE_CAPABILITIES[access.ROLE_VIEW]
     try:
         headers = {"Origin": h.origin, "Content-Type": "application/json"}
@@ -640,7 +641,64 @@ def test_a_real_route_error_stays_in_the_log():
     print("ein echter Routenfehler bleibt im Log: OK")
 
 
+def test_a_taken_port_makes_the_server_fall_back():
+    """Windows: SO_REUSEADDR lets a second socket bind a port that is already taken, so
+    the server shared 47800 with another program instead of falling back (eng review
+    2026-10-03, Fund 1). The other program here uses SO_REUSEADDR as well - the shape
+    that slipped through."""
+    other = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    other.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    other.bind(("127.0.0.1", 0))
+    other.listen()
+    taken = other.getsockname()[1]
+    core = FakeCore()
+    from soundboard.bridgecore import BridgeCore
+    bridge = BridgeCore(core, lambda cid, msgs: None, access=FakeAccess())
+    server = webserver.SseServer(bridge, Path(_TMP) / "dist", port=taken)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while server._httpd is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert server._httpd is not None, "server did not start"
+        assert server.port != taken, f"server shares the taken port {taken}"
+        assert server.fell_back is True
+        assert server.requested_port == taken
+    finally:
+        server.stop()
+        thread.join(timeout=3)
+        other.close()
+    print("ein belegter Port fuehrt zum Ausweichen, nicht zum Teilen: OK")
+
+
+def test_a_stream_that_is_not_read_is_ended_not_grown():
+    """A client whose stream backs up must not grow the server's queue without bound
+    (eng review 2026-10-03, Fund 3): the stream ends, the page reconnects and resyncs."""
+    h = Harness()
+    try:
+        stream = h.server.open_stream("c-stuck")
+        for n in range(webserver.MAX_STREAM_BACKLOG + 25):
+            h.server.deliver("c-stuck", [{"n": n}])
+        items = []
+        while True:
+            try:
+                items.append(stream.get_nowait())
+            except queue.Empty:
+                break
+        assert items and items[-1] is None, "an overflowing stream must be told to end"
+        assert len(items) <= webserver.MAX_STREAM_BACKLOG, len(items)
+        # once ended, later bundles are not queued for it any more
+        h.server.deliver("c-stuck", [{"n": "late"}])
+        assert stream.empty()
+    finally:
+        h.stop()
+    print("ein haengender Strom endet statt zu wachsen: OK")
+
+
 def main():
+    test_a_taken_port_makes_the_server_fall_back()
+    test_a_stream_that_is_not_read_is_ended_not_grown()
     test_host_and_origin_must_be_our_own()
     test_static_paths_cannot_escape()
     test_the_page_needs_no_key_but_state_and_send_do()

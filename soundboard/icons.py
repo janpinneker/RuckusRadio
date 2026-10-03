@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 from soundboard.theme import BG
 
@@ -26,6 +26,20 @@ def load_circle(path: str | Path, size: int = ICON_SIZE) -> Image.Image:
             return crop_to_circle(img, size)
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise IconError() from exc
+
+def save_cover(source_path: str | Path, dest_path: str | Path, size: int = 512) -> Path:
+    """Schritt C: a square collection cover (centre crop, RGB PNG). IconError before
+    touching dest_path if the source isn't a readable image."""
+    try:
+        with Image.open(source_path) as img:
+            square = ImageOps.fit(ImageOps.exif_transpose(img).convert("RGB"), (size, size), Image.LANCZOS)
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        raise IconError() from exc
+    dest_path = Path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    square.save(dest_path, format="PNG")
+    return dest_path
+
 
 _PLACEHOLDER_COLORS = [
     "#22D3EE", "#7C3AED", "#F97316", "#F43F5E", "#10B981", "#EAB308",

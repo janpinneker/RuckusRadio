@@ -18,14 +18,14 @@ import customtkinter as ctk
 if TYPE_CHECKING:
     from pathlib import Path
 
-from soundboard import levels, protocol as p, theme
+from soundboard import protocol as p, theme
 from soundboard.layout import signal_check_summary
 from soundboard.library import NOTHING_TO_EXPORT
 from soundboard.packs import sanitize_filename
 from soundboard.routing import NO_VIRTUAL_MIC
 from soundboard.updates import UPDATE_LAUNCH_FAILED, UPDATE_QUESTION, launch_installer
 from soundboard.widgets import (
-    AddSoundDialog, HotkeyCaptureDialog, SoundTile, VolumeDialog, _klangbild_cfg,
+    AddSoundDialog, HotkeyCaptureDialog, SoundTile, VolumeDialog,
 )
 
 ctk.set_appearance_mode("dark")
@@ -216,9 +216,8 @@ class RuckusRadioApp(ctk.CTk):
             # every existing tile's badge showing the old target. Refresh each tile's
             # badge directly instead of forcing a full tile rebuild for this.
             self._targets_key = targets_key
-            cfg = _klangbild_cfg(self)
             for tile in self.board.tiles.values():
-                tile.level_label.configure(text=levels.loudness_badge(tile.sound, cfg))
+                tile.refresh_badge()
         playback = state.get("playback") or {}
         self.playing_ids = set(playback.get("playing") or [])
         self.missing_ids = set(playback.get("missing") or [])

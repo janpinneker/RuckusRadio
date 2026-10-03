@@ -2,9 +2,10 @@
 
 Pack layout (zip, deflate):
     manifest.json                 {"format": "ruckuspack", "version": 1, "sounds": [<folder>, ...]}
-    <folder>/meta.json            {"name": str, "volume": float, "audio": <filename in folder>, "trim"?: {"start", "end"}}
+    <folder>/meta.json            {"name": str, "volume": float, "audio": <filename in folder>, "trim"?: {"start", "end"}, "tags"?: [str]}
     <folder>/<audio filename>     the sound's mp3
     <folder>/icon.png             optional
+    <folder>/cover.png            optional, the sound's own square cover (1.5.0)
 
 Security: every zip member name is validated before use (no absolute paths,
 no ".." segments) and members are never extracted to disk by their own path —
@@ -46,6 +47,8 @@ MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500 MB, guards against zip bombs
 _MEMBER_READ_ERRORS = (zipfile.BadZipFile, OSError, zlib.error)
 
 _ILLEGAL_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+# Device names Windows refuses as a file name, whatever the case or extension.
+_RESERVED_FILENAMES = re.compile(r"(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])", re.IGNORECASE)
 
 
 class PackError(Exception):
@@ -84,10 +87,14 @@ def sanitize_filename(name: str) -> str:
     """Make `name` safe to use as a Windows file name (without extension):
     strip the characters Windows forbids (\\ / : * ? " < > |), collapse
     whitespace, strip trailing dots/spaces (Windows also rejects those at the
-    end of a name), and fall back to "Sound" if nothing is left."""
+    end of a name), suffix reserved device names (CON, NUL, COM1 ...) with "_",
+    and fall back to "Sound" if nothing is left."""
     cleaned = _ILLEGAL_FILENAME_CHARS.sub("", name)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     cleaned = cleaned.rstrip(" .")
+    stem, dot, rest = cleaned.partition(".")
+    if _RESERVED_FILENAMES.fullmatch(stem.rstrip()):
+        cleaned = f"{stem.rstrip()}_{dot}{rest}"
     return cleaned or "Sound"
 
 
@@ -117,12 +124,19 @@ def export_pack(config_data: dict[str, Any], data_dir: Path, sound_ids: list[str
                 icon_src = data_dir / sound.get("icon", "")
                 if sound.get("icon") and icon_src.exists():
                     zf.write(icon_src, f"{folder}/icon.png")
+                cover_src = data_dir / config.cover_path(sound["id"])
+                if sound.get("cover") and cover_src.is_file():
+                    zf.write(cover_src, f"{folder}/cover.png")  # Jan 2026-10-04: covers travel
 
                 meta = {"name": sound["name"], "volume": sound.get("volume", 1.0), "audio": audio_name}
                 if sound.get("trim"):
                     meta["trim"] = sound["trim"]  # C8: the cut travels, the file stays whole
                 if sound.get("category"):
                     meta["category"] = sound["category"]  # F5: only when set by hand/measurement
+                if sound.get("tags"):
+                    # Bibliothek 2.0 A10: tags describe the sound and travel; folder and
+                    # favorite are the user's own order and stay home.
+                    meta["tags"] = list(sound["tags"])
                 zf.writestr(f"{folder}/meta.json", json.dumps(meta, ensure_ascii=False))
 
             zf.writestr(MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False))
@@ -243,14 +257,24 @@ def import_pack(pack_path: Path, existing_names: set[str], data_dir: Path) -> li
                 except _MEMBER_READ_ERRORS:
                     raise _corrupt(f"Icon von „{name}“ ist unlesbar")
 
+            cover_member = f"{folder}/cover.png"
+            cover_bytes = None
+            if cover_member in namelist:
+                try:
+                    cover_bytes = zf.read(cover_member)
+                except _MEMBER_READ_ERRORS:
+                    raise _corrupt(f"Cover von „{name}“ ist unlesbar")
+
             prepared.append({
-                "name": str(name),
+                "name": config.clip_sound_name(str(name)) or "Sound",
+                "cover_bytes": cover_bytes,
                 "volume": volume,
                 "audio_bytes": audio_bytes,
                 "audio_ext": ext,
                 "icon_bytes": icon_bytes,
                 "trim": trimming.clean_trim(meta.get("trim")),
                 "category": category,
+                "tags": config.normalize_tags(meta.get("tags")),
             })
 
         # All validated — now actually write files (only computed destination
@@ -284,6 +308,17 @@ def import_pack(pack_path: Path, existing_names: set[str], data_dir: Path) -> li
                 icon_image.save(dest_icon, format="PNG")
                 written_paths.append(dest_icon)
 
+                cover = None
+                if item["cover_bytes"] is not None:
+                    dest_cover = data_dir / config.cover_path(sound_id)
+                    try:
+                        # redrawn by Pillow like the icon: never the pack's raw bytes
+                        icons.save_cover(io.BytesIO(item["cover_bytes"]), dest_cover)
+                        written_paths.append(dest_cover)
+                        cover = config.cover_path(sound_id)
+                    except icons.IconError:
+                        cover = None  # a broken cover costs only the cover
+
                 name = _unique_against(used_names, item["name"])
                 used_names.add(name)
                 sound = {
@@ -293,6 +328,11 @@ def import_pack(pack_path: Path, existing_names: set[str], data_dir: Path) -> li
                     "icon": f"icons/{sound_id}.png",
                     "hotkey": None,
                     "volume": item["volume"],
+                    # Bibliothek 2.0 A10: tags travel, folder and favorite start fresh
+                    "folder_id": None,
+                    "tags": item["tags"],
+                    "favorite": False,
+                    "cover": cover,
                 }
                 if item["trim"] is not None:
                     sound["trim"] = item["trim"]

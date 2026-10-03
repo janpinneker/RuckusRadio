@@ -61,6 +61,12 @@ WHATS_NEW = {
               "Spotify-Regler stellst du nur für deine Ohren. Jedes Kabel hat einen Schalter "
               "„Musik“, im Dock gibt es „Discord: Musik an/aus“. Außerdem: Musik klingt so laut "
               "wie in Spotify, und „Kürzen…“ schneidet Sounds zu."),
+    "1.5.0": ("Neu: Ordner und Playlists für deine Sounds – mit eigenem Cover, Favoriten und "
+              "Stichwörtern. Sounds ziehst du auf eine Kachel oder nutzt „Verschieben nach…“, "
+              "und jeder Sound kann ein eigenes Cover bekommen. Die Spotify-Seite ist neu "
+              "sortiert: zuletzt gespielt als Karten, Alben nach Wiedergaben. Hinzufügen nimmt "
+              "auch m4a, wav, ogg und flac. Deine Spotify-Anmeldung liegt jetzt verschlüsselt "
+              "auf der Platte."),
 }
 
 

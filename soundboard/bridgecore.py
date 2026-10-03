@@ -27,7 +27,7 @@ MAX_PENDING = 1000
 REJECTED = "Die Oberfläche hat eine ungültige Nachricht geschickt: {}"
 FORBIDDEN = "Dieser Zugang darf nur abspielen und ansehen. Verwaltung im Fenster."
 _FILE_PATH_COMMANDS = (protocol.AddSound, protocol.SetSoundIcon,
-                       protocol.ExportSounds, protocol.ImportPack)
+                       protocol.ExportSounds, protocol.ImportPack, protocol.SetCollectionCover)
 
 
 class Client:

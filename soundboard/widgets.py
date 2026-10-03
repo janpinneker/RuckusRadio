@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 
-from soundboard import hotkeys, icons, theme
+from soundboard import filedialogs, hotkeys, icons, theme
 from soundboard.config import MAX_SOUND_VOLUME, clamp_volume
 from soundboard.dynamics import db_to_gain, gain_to_db
 from soundboard.layout import ellipsize, keycap_text
@@ -177,6 +177,11 @@ class SoundTile(ctk.CTkFrame):
     def set_playing(self, playing: bool) -> None:
         self.disc.set_playing(playing)
 
+    def refresh_badge(self) -> None:
+        """Re-read the Klangbild targets from the app's snapshot (SetKlangbild changes
+        them without touching this tile's sound dict)."""
+        self.level_label.configure(text=loudness_badge(self.sound, _klangbild_cfg(self.app)))
+
     def set_missing(self, missing: bool) -> None:
         """Audio file missing/unreadable: MUTED name, 'Datei fehlt' in place of the keycap."""
         if missing == self._missing:
@@ -324,7 +329,7 @@ class AddSoundDialog(ctk.CTkToplevel):
 
     def _pick_audio(self):
         path = filedialog.askopenfilename(parent=self, title="Sound wählen",
-                                          filetypes=[("Audio/Video", "*.mp3 *.mp4")])
+                                          filetypes=filedialogs.SOUND_TYPES)
         if path:
             self._audio_path = Path(path)
             self._audio_label.configure(text=self._audio_path.name, text_color=theme.TEXT)

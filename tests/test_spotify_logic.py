@@ -792,6 +792,25 @@ def test_service_recent_counts_playlist_plays_from_context_before_collapsing():
     print("playlist_plays counts recently-played's context before the repeat collapse: OK")
 
 
+def test_service_recent_counts_album_plays_too():
+    # Hand check 2026-10-03b: albums sort by plays like playlists - an album context counts
+    # under its own uri in the same map; an artist context still does not.
+    api = core_fakes.FakeSpotifyApi(
+        recent=[TRACK, TRACK2, TRACK],
+        recent_contexts=[
+            {"type": "album", "uri": "spotify:album:a1"},
+            {"type": "album", "uri": "spotify:album:a1"},
+            {"type": "artist", "uri": "spotify:artist:x"},
+        ],
+    )
+    c, _events = _core_with_spotify(api)
+    c.spotify.finish_login("r1", {"display_name": "Jan"})
+    c.send(p.SpotifyLoadRecent())
+    state = c.state()["spotify"]
+    assert state["playlist_plays"] == {"spotify:album:a1": 2}, state["playlist_plays"]
+    print("album contexts count into playlist_plays: OK")
+
+
 def test_service_tracks_loading_and_errors_per_section():
     # R1/R2: `loading`/`errors` are per section, `busy`/`error` stay as derived fields.
     api = core_fakes.FakeSpotifyApi(tracks=[TRACK], search=[TRACK])
@@ -1379,6 +1398,7 @@ def main():
     test_a_token_with_both_new_scopes_needs_no_reconnect()
     test_service_loads_recent_and_collapses_consecutive_repeats()
     test_service_recent_counts_playlist_plays_from_context_before_collapsing()
+    test_service_recent_counts_album_plays_too()
     test_service_tracks_loading_and_errors_per_section()
     test_service_discards_a_stale_answer_of_the_same_section()
     test_service_logout_clears_loading_errors_and_recent()

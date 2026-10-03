@@ -17,6 +17,9 @@ import logging
 import secrets
 
 from .protocol import (
+    AddToPlaylist, ClearCollectionCover, CreateFolder, CreatePlaylist, DeleteFolder, DeletePlaylist, MoveFolder, MoveToFolder,
+    RequestSetCollectionCover, SetCollectionCover,
+    RemoveFromPlaylist, RenameFolder, RenamePlaylist, SetFavorite, SetTags,
     AddSound, CheckForUpdates, ClearSoundTrim, CompleteOnboarding, DeleteSound, ExportSounds,
     ImportPack, InstallUpdate, LoadWaveform, Play, PreviewTrim, RegenerateViewToken,
     RemoveHotkey, RenameSound,
@@ -71,6 +74,11 @@ COMMAND_CAPABILITY: dict[type, str] = {
     SetHotkey: LIBRARY,
     RemoveHotkey: LIBRARY, SetStopAllHotkey: LIBRARY, SetSidebarPins: LIBRARY, ExportSounds: LIBRARY,
     ImportPack: LIBRARY,
+    # Bibliothek 2.0: ordering the sounds is managing the library (the view may not)
+    CreateFolder: LIBRARY, RenameFolder: LIBRARY, DeleteFolder: LIBRARY, MoveFolder: LIBRARY, MoveToFolder: LIBRARY,
+    CreatePlaylist: LIBRARY, RenamePlaylist: LIBRARY, DeletePlaylist: LIBRARY,
+    AddToPlaylist: LIBRARY, RemoveFromPlaylist: LIBRARY, SetTags: LIBRARY, SetFavorite: LIBRARY,
+    RequestSetCollectionCover: LIBRARY, SetCollectionCover: LIBRARY, ClearCollectionCover: LIBRARY,
     # Die vier Request*-Befehle (LIBRARY): die Seite bittet, Python oeffnet den Dialog.
     RequestAddSound: LIBRARY, RequestImportPack: LIBRARY,
     RequestExportSounds: LIBRARY, RequestSetSoundIcon: LIBRARY,

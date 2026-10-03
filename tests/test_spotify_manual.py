@@ -81,7 +81,8 @@ from urllib.parse import urlsplit
 _REAL_DIR = Path(os.environ.get("APPDATA", "")) / "Soundboard"
 _REAL_CONFIG = _REAL_DIR / "config.json"
 _DATA_DIR = Path(tempfile.mkdtemp(prefix="ruckus-spotify-manual-"))
-for _name in ("config.json", "secrets.json"):
+# secrets.dat is DPAPI-encrypted for this Windows account, so the copy still decrypts
+for _name in ("config.json", "secrets.dat", "secrets.json"):
     if (_REAL_DIR / _name).exists():
         shutil.copy2(_REAL_DIR / _name, _DATA_DIR / _name)
 os.environ["RUCKUS_DATA_DIR"] = str(_DATA_DIR)
@@ -118,23 +119,18 @@ def registered_uri() -> str:
 
 
 def drop_saved_token() -> bool:
-    r"""Loescht ``spotify_token`` aus der **Temp-Kopie** der secrets.json.
+    r"""Loescht ``spotify_token`` aus der **Temp-Kopie** der Geheimnisse.
 
     Nur die Kopie: das echte ``%APPDATA%\Soundboard`` wird nie angefasst. Ohne diesen
     Schritt startet der Kern ``connected`` (der Token ist ja da), die Anmeldung wird
     uebersprungen - und ein Prueflauf, der den Browser-Weg belegen soll, belegt ihn
     nicht. Rueckgabe: True, wenn wirklich ein Token entfernt wurde.
     """
-    path = _DATA_DIR / "secrets.json"
-    if not path.exists():
+    from soundboard import store as store_mod
+    tokens = store_mod.Store(None, data=config._default_config())
+    if tokens.secret("spotify_token") is None:
         return False
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return False
-    if not isinstance(data, dict) or data.pop("spotify_token", None) is None:
-        return False
-    path.write_text(json.dumps(data), encoding="utf-8")
+    tokens.forget_secret("spotify_token")
     return True
 
 
@@ -438,7 +434,7 @@ def build_player_api(client_id: str):
 
     ``None``, wenn kein Login gespeichert ist (z. B. nach ``--fresh-login`` ohne
     abgeschlossene Anmeldung) - dann baut ``--player`` keinen eigenen Anmeldelauf auf,
-    er ueberspringt einfach. Liest nur die Temp-Kopie von ``secrets.json``
+    er ueberspringt einfach. Liest nur die Temp-Kopie der Geheimnisse
     (``_DATA_DIR``, siehe Modul-Docstring) - nie das echte Verzeichnis.
     """
     from soundboard import store as store_mod

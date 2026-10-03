@@ -1033,7 +1033,8 @@ class SpotifyService:
         plays: dict[str, int] = {}
         for entry in payload.get("items") or []:
             context = entry.get("context") if isinstance(entry, dict) else None
-            if isinstance(context, dict) and context.get("type") == "playlist":
+            # albums count too, under their own uri (hand check 2026-10-03b: albums sort by plays)
+            if isinstance(context, dict) and context.get("type") in ("playlist", "album"):
                 # counted over every one of the (up to 50) entries, *before* the directly-
                 # consecutive-repeat collapse below - a played-three-times-in-a-row track
                 # must still count as three plays of its playlist (Jan, 2026-09-29).

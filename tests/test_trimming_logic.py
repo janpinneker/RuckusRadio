@@ -159,19 +159,18 @@ def test_export_trimmed_leaves_no_partial_file_on_failure():
 
 
 def test_peaks_does_not_copy_the_buffer_to_float64():
-    big = np.zeros((96000, 2), dtype=np.float32)
-    original_asarray = np.asarray
-
-    def guard(a, dtype=None, *args, **kwargs):
-        if dtype == np.float64 and getattr(a, "shape", None) == big.shape:
-            raise AssertionError("peaks must not build a float64 copy of the whole buffer")
-        return original_asarray(a, dtype=dtype, *args, **kwargs)
-
-    np.asarray = guard
+    # Measures the real allocation peak (numpy reports to tracemalloc), whatever call
+    # would build the copy. 8 MB stereo float32: the float32 mono mix is 4 MB; any
+    # float64 copy of the buffer or of the mono mix needs 8 MB more (probe: 12/24 MB).
+    import tracemalloc
+    big = np.zeros((1_000_000, 2), dtype=np.float32)
+    tracemalloc.start()
     try:
         trimming.peaks(big)
+        peak_mb = tracemalloc.get_traced_memory()[1] / 1e6
     finally:
-        np.asarray = original_asarray
+        tracemalloc.stop()
+    assert peak_mb < 6.0, f"peaks allocated {peak_mb:.1f} MB - a float64 copy of the buffer?"
     print("peaks baut keine float64-Kopie des ganzen Puffers: OK")
 
 

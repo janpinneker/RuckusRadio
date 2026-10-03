@@ -16,7 +16,8 @@ import threading
 
 log = logging.getLogger(__name__)
 
-SOUND_TYPES = [("Audio", "*.mp3 *.mp4"), ("Alle Dateien", "*.*")]
+# Bibliothek 2.0 A12: everything ffmpeg "essentials" reads; prepare_sound stores MP3.
+SOUND_TYPES = [("Audio", "*.mp3 *.mp4 *.m4a *.aac *.wav *.ogg *.opus *.flac"), ("Alle Dateien", "*.*")]
 ICON_TYPES = [("Bilder", "*.png *.jpg *.jpeg *.webp *.bmp"), ("Alle Dateien", "*.*")]
 PACK_TYPES = [("Ruckus-Paket", "*.ruckuspack"), ("Alle Dateien", "*.*")]
 AUDIO_TARGET_TYPES = [("MP3", "*.mp3")]
@@ -55,7 +56,10 @@ class FileDialogs:
             while True:
                 kind, kwargs, box = self._queue.get()
                 try:
-                    box.put(self._open(filedialog, kwargs, kind))
+                    # parent=root: without it Tk takes its global default root, which belongs
+                    # to whichever dialog thread started first (library and collections each
+                    # have one) - "main thread is not in main loop" (log 2026-10-03)
+                    box.put(self._open(filedialog, kwargs, kind, parent=root))
                 except Exception:  # noqa: BLE001 - a broken dialog must not kill the thread
                     log.exception("file dialog failed")
                     box.put(None)
@@ -63,25 +67,27 @@ class FileDialogs:
             root.destroy()
 
     @staticmethod
-    def _open(filedialog, kwargs: dict, kind: str):
+    def _open(filedialog, kwargs: dict, kind: str, parent=None):
         if kind == "sound":
-            return filedialog.askopenfilename(title="Sound auswählen",
+            return filedialog.askopenfilename(parent=parent, title="Sound auswählen",
                                               filetypes=SOUND_TYPES) or None
         if kind == "icon":
-            return filedialog.askopenfilename(title="Icon auswählen",
+            return filedialog.askopenfilename(parent=parent, title="Icon auswählen",
                                               filetypes=ICON_TYPES) or None
         if kind == "pack":
-            return filedialog.askopenfilename(title="Sound-Paket importieren",
+            return filedialog.askopenfilename(parent=parent, title="Sound-Paket importieren",
                                               filetypes=PACK_TYPES) or None
         if kind == "audio_target":
             # Windows asks before overwriting an existing file (confirmoverwrite default)
             return filedialog.asksaveasfilename(
+                parent=parent,
                 title="Gekürzten Sound speichern",
                 initialfile=kwargs.get("default_name") or "Sound.mp3",
                 defaultextension=".mp3",
                 filetypes=AUDIO_TARGET_TYPES,
             ) or None
         return filedialog.asksaveasfilename(
+                parent=parent,
             title="Sound-Paket speichern",
             initialfile=kwargs.get("default_name") or "sounds.ruckuspack",
             defaultextension=".ruckuspack",

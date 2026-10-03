@@ -29,14 +29,23 @@ $ffmpegDest = Join-Path $assetsDir "ffmpeg.exe"
 $ffprobeDest = Join-Path $assetsDir "ffprobe.exe"
 if (-not (Test-Path $ffmpegDest) -or -not (Test-Path $ffprobeDest)) {
     Write-Output "ffmpeg.exe/ffprobe.exe missing from assets\, fetching Gyan's essentials build..."
-    $essentialsUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+    # Pinned release + SHA-256 of the zip: a moved "latest" link or a tampered download
+    # must never end up in the exe. Bump both together when updating ffmpeg.
+    $essentialsUrl = "https://github.com/GyanD/codexffmpeg/releases/download/9.0.1/ffmpeg-9.0.1-essentials_build.zip"
+    $essentialsSha256 = "fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9"
     $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ruckus-ffmpeg-" + [Guid]::NewGuid())
     New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
     $zipPath = Join-Path $tmpDir "ffmpeg-essentials.zip"
     $downloaded = $false
+    $hashMismatch = $false
     try {
         Write-Output "Downloading $essentialsUrl ..."
         Invoke-WebRequest -Uri $essentialsUrl -OutFile $zipPath -UseBasicParsing
+        $actualSha256 = (Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLowerInvariant()
+        if ($actualSha256 -ne $essentialsSha256) {
+            $hashMismatch = $true
+            throw "SHA-256 mismatch for $essentialsUrl (expected $essentialsSha256, got $actualSha256)."
+        }
         Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
         $ffmpegSrc = Get-ChildItem $tmpDir -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
         $ffprobeSrc = Get-ChildItem $tmpDir -Filter "ffprobe.exe" -Recurse | Select-Object -First 1
@@ -48,6 +57,10 @@ if (-not (Test-Path $ffmpegDest) -or -not (Test-Path $ffprobeDest)) {
         $downloaded = $true
         Write-Output "Fetched ffmpeg/ffprobe (essentials build) into assets\"
     } catch {
+        if ($hashMismatch) {
+            Remove-Item -Recurse -Force $tmpDir -Confirm:$false -ErrorAction SilentlyContinue
+            throw "$_ Refusing to build with an unverified ffmpeg."
+        }
         Write-Warning "Essentials download failed ($_). Falling back to the winget Gyan.FFmpeg install (larger, includes every codec)."
     } finally {
         Remove-Item -Recurse -Force $tmpDir -Confirm:$false -ErrorAction SilentlyContinue
@@ -57,7 +70,7 @@ if (-not (Test-Path $ffmpegDest) -or -not (Test-Path $ffprobeDest)) {
         $wingetRoot = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
         $found = Get-ChildItem $wingetRoot -Filter "ffmpeg.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $found) {
-            throw "Could not fetch ffmpeg-release-essentials.zip and no winget Gyan.FFmpeg install was found under $wingetRoot. Install it with 'winget install Gyan.FFmpeg', or download https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip yourself and copy ffmpeg.exe + ffprobe.exe into assets\ (see README.md)."
+            throw "Could not fetch the pinned ffmpeg essentials build and no winget Gyan.FFmpeg install was found under $wingetRoot. Install it with 'winget install Gyan.FFmpeg', or download https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip yourself and copy ffmpeg.exe + ffprobe.exe into assets\ (see README.md)."
         }
         $srcDir = $found.DirectoryName
         Write-Output "Copying ffmpeg/ffprobe from $srcDir (winget fallback)"
